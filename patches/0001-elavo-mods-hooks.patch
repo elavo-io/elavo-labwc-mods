@@ -1,7 +1,7 @@
 diff --git a/src/meson.build b/src/meson.build
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -58,3 +58,4 @@
+@@ -58,3 +58,4 @@ subdir('input')
  subdir('menu')
  subdir('scaled-buffer')
  subdir('ssd')
@@ -17,7 +17,7 @@ diff --git a/src/output.c b/src/output.c
  
  #if WLR_HAS_X11_BACKEND
  	#include <wlr/backend/x11.h>
-@@ -274,6 +275,7 @@
+@@ -274,6 +275,7 @@ handle_output_frame(struct wl_listener *listener, void *data)
  
  	pending->tearing_page_flip = output_get_tearing_allowance(output);
  
@@ -36,7 +36,7 @@ diff --git a/src/server.c b/src/server.c
  
  #define LAB_EXT_DATA_CONTROL_VERSION 1
  #define LAB_EXT_FOREIGN_TOPLEVEL_LIST_VERSION 1
-@@ -841,6 +842,7 @@
+@@ -841,6 +842,7 @@ server_init(void)
  #if HAVE_XWAYLAND
  	xwayland_server_init(server.compositor);
  #endif
@@ -44,7 +44,7 @@ diff --git a/src/server.c b/src/server.c
  	wl_event_loop_add_idle(server.wl_event_loop, nag_show_callback, NULL);
  }
  
-@@ -876,6 +878,7 @@
+@@ -876,6 +878,7 @@ server_start(void)
  void
  server_finish(void)
  {
@@ -52,6 +52,39 @@ diff --git a/src/server.c b/src/server.c
  #if HAVE_XWAYLAND
  	xwayland_server_finish();
  #endif
+diff --git a/src/ssd/ssd-shadow.c b/src/ssd/ssd-shadow.c
+--- a/src/ssd/ssd-shadow.c
++++ b/src/ssd/ssd-shadow.c
+@@ -10,6 +10,7 @@
+ #include "ssd-internal.h"
+ #include "theme.h"
+ #include "view.h"
++#include "elavo-mods/elavo-mods.h"
+ 
+ /*
+  * Implements point_accepts_input for a buffer which never accepts input
+@@ -255,20 +256,7 @@ ssd_shadow_update(struct ssd *ssd)
+ 	assert(ssd);
+ 	assert(ssd->shadow.tree);
+ 
+-	struct view *view = ssd->view;
+-	struct theme *theme = rc.theme;
+-	bool maximized = view->maximized == VIEW_AXIS_BOTH;
+-	bool tiled_shadows = false;
+-	if (rc.shadows_on_tiled) {
+-		if (rc.gap >= theme->window[SSD_ACTIVE].shadow_size
+-				&& rc.gap >= theme->window[SSD_INACTIVE].shadow_size) {
+-			tiled_shadows = true;
+-		} else {
+-			wlr_log(WLR_INFO, "gap size < shadow_size, ignore rc.shadows_ontiled");
+-		}
+-	};
+-	bool show_shadows = rc.shadows_enabled && !maximized
+-		&& (!view_is_tiled(ssd->view) || tiled_shadows);
++	bool show_shadows = elavo_mods_ssd_shadows(ssd);
+ 	wlr_scene_node_set_enabled(&ssd->shadow.tree->node, show_shadows);
+ 	if (show_shadows) {
+ 		set_shadow_geometry(ssd);
 diff --git a/src/ssd/ssd-titlebar.c b/src/ssd/ssd-titlebar.c
 --- a/src/ssd/ssd-titlebar.c
 +++ b/src/ssd/ssd-titlebar.c
@@ -63,7 +96,7 @@ diff --git a/src/ssd/ssd-titlebar.c b/src/ssd/ssd-titlebar.c
  
  static void set_squared_corners(struct ssd *ssd, bool enable);
  static void set_alt_button_icon(struct ssd *ssd, enum lab_node_type type, bool enable);
-@@ -122,7 +123,7 @@
+@@ -122,7 +123,7 @@ ssd_titlebar_create(struct ssd *ssd)
  	if (squared) {
  		ssd->state.was_squared = true;
  	}
@@ -72,7 +105,7 @@ diff --git a/src/ssd/ssd-titlebar.c b/src/ssd/ssd-titlebar.c
  
  	if (view->shaded) {
  		set_alt_button_icon(ssd, LAB_NODE_BUTTON_SHADE, true);
-@@ -280,7 +281,7 @@
+@@ -280,7 +281,7 @@ ssd_titlebar_update(struct ssd *ssd)
  
  	if (ssd->state.was_maximized != maximized
  			|| ssd->state.was_squared != squared) {
@@ -81,7 +114,7 @@ diff --git a/src/ssd/ssd-titlebar.c b/src/ssd/ssd-titlebar.c
  		if (ssd->state.was_maximized != maximized) {
  			set_alt_button_icon(ssd, LAB_NODE_BUTTON_MAXIMIZE, maximized);
  		}
-@@ -308,7 +309,7 @@
+@@ -308,7 +309,7 @@ ssd_titlebar_update(struct ssd *ssd)
  	/* Center buttons vertically within titlebar */
  	int y = (theme->titlebar_height - theme->window_button_height) / 2;
  	int x;
@@ -101,7 +134,7 @@ diff --git a/src/theme.c b/src/theme.c
  
  struct button {
  	const char *name;
-@@ -1703,6 +1704,7 @@
+@@ -1703,6 +1704,7 @@ post_processing(struct theme *theme)
  		+ 2 * switcher_classic_theme->item_padding_y
  		+ 2 * switcher_classic_theme->item_active_border_width;
  
@@ -109,3 +142,30 @@ diff --git a/src/theme.c b/src/theme.c
  	if (rc.corner_radius >= theme->titlebar_height) {
  		rc.corner_radius = theme->titlebar_height - 1;
  	}
+@@ -1846,6 +1848,7 @@ theme_init(struct theme *theme, const char *theme_name)
+ 	create_corners(theme);
+ 	load_buttons(theme);
+ 	create_shadows(theme);
++	elavo_mods_shadows_drawn(theme);
+ }
+ 
+ static void destroy_img(struct lab_img **img)
+diff --git a/src/view.c b/src/view.c
+--- a/src/view.c
++++ b/src/view.c
+@@ -33,6 +33,7 @@
+ #include "window-rules.h"
+ #include "wlr/util/log.h"
+ #include "workspaces.h"
++#include "elavo-mods/elavo-mods.h"
+ 
+ #if HAVE_XWAYLAND
+ #include <wlr/xwayland.h>
+@@ -563,6 +564,7 @@ view_moved(struct view *view)
+ 	}
+ 	view_update_outputs(view);
+ 	ssd_update_geometry(view->ssd);
++	elavo_mods_view_moved(view);
+ 	cursor_update_focus();
+ 	if (rc.resize_indicator && server.grabbed_view == view) {
+ 		resize_indicator_update(view);

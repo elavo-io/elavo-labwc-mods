@@ -406,6 +406,7 @@ handle_new_surface(struct wl_listener *listener, void *data)
 void
 elavo_mods_output_frame(struct output *output)
 {
+	elavo_mods_shadows_frame();
 	if (!output || wl_list_empty(&blurs)) {
 		return;
 	}
@@ -437,6 +438,7 @@ elavo_mods_init(void)
 void
 elavo_mods_finish(void)
 {
+	elavo_mods_shadows_finish();
 	struct elavo_blur *blur, *tmp;
 	wl_list_for_each_safe(blur, tmp, &blurs, link) {
 		if (blur->resource) {

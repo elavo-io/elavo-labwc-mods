@@ -32,6 +32,7 @@ labwc_deps += declare_dependency(
 
 labwc_sources += files(
   'corners.c',
+  'shadows.c',
   'theme-keys.c',
   'blur.c',
   'background-effect.c',

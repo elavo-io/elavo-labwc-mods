@@ -14,6 +14,7 @@
 #include "labwc.h"
 
 static bool round_maximized;
+static bool shadows_on_maximized;
 static bool blur_enabled = true;
 static int blur_levels = 3;
 
@@ -21,6 +22,12 @@ bool
 elavo_mods_round_maximized(void)
 {
 	return round_maximized;
+}
+
+bool
+elavo_mods_shadows_on_maximized(void)
+{
+	return shadows_on_maximized;
 }
 
 bool
@@ -73,6 +80,11 @@ apply_line(char *line)
 		set_bool(colon + 1, &rc.shadows_enabled);
 	} else if (!strcmp(line, "window.dropShadowsOnTiled")) {
 		set_bool(colon + 1, &rc.shadows_on_tiled);
+	} else if (!strcmp(line, "window.dropShadowsOnMaximized")) {
+		int v = parse_bool(colon + 1, -1);
+		if (v >= 0) {
+			shadows_on_maximized = v;
+		}
 	} else if (!strcmp(line, "window.blur.strength")) {
 		int n = atoi(colon + 1);
 		if (n < 1) {
@@ -182,6 +194,7 @@ void
 elavo_mods_theme_loaded(void)
 {
 	round_maximized = false;
+	shadows_on_maximized = false;
 	blur_levels = 3;
 
 	if (rc.theme_name) {
@@ -197,4 +210,5 @@ elavo_mods_theme_loaded(void)
 	paths_destroy(&override);
 
 	read_blur_switch();
+	elavo_mods_shadows_theme_changed();
 }
