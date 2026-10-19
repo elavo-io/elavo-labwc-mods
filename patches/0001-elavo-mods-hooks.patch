@@ -1,0 +1,111 @@
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -58,3 +58,4 @@
+ subdir('menu')
+ subdir('scaled-buffer')
+ subdir('ssd')
++subdir('elavo-mods')
+diff --git a/src/output.c b/src/output.c
+--- a/src/output.c
++++ b/src/output.c
+@@ -38,6 +38,7 @@
+ #include "session-lock.h"
+ #include "view.h"
+ #include "xwayland.h"
++#include "elavo-mods/elavo-mods.h"
+ 
+ #if WLR_HAS_X11_BACKEND
+ 	#include <wlr/backend/x11.h>
+@@ -274,6 +275,7 @@
+ 
+ 	pending->tearing_page_flip = output_get_tearing_allowance(output);
+ 
++	elavo_mods_output_frame(output);
+ 	lab_wlr_scene_output_commit(scene_output, pending);
+ 
+ 	struct timespec now = { 0 };
+diff --git a/src/server.c b/src/server.c
+--- a/src/server.c
++++ b/src/server.c
+@@ -77,6 +77,7 @@
+ #include "view.h"
+ #include "workspaces.h"
+ #include "xwayland.h"
++#include "elavo-mods/elavo-mods.h"
+ 
+ #define LAB_EXT_DATA_CONTROL_VERSION 1
+ #define LAB_EXT_FOREIGN_TOPLEVEL_LIST_VERSION 1
+@@ -841,6 +842,7 @@
+ #if HAVE_XWAYLAND
+ 	xwayland_server_init(server.compositor);
+ #endif
++	elavo_mods_init();
+ 	wl_event_loop_add_idle(server.wl_event_loop, nag_show_callback, NULL);
+ }
+ 
+@@ -876,6 +878,7 @@
+ void
+ server_finish(void)
+ {
++	elavo_mods_finish();
+ #if HAVE_XWAYLAND
+ 	xwayland_server_finish();
+ #endif
+diff --git a/src/ssd/ssd-titlebar.c b/src/ssd/ssd-titlebar.c
+--- a/src/ssd/ssd-titlebar.c
++++ b/src/ssd/ssd-titlebar.c
+@@ -18,6 +18,7 @@
+ #include "ssd-internal.h"
+ #include "theme.h"
+ #include "view.h"
++#include "elavo-mods/elavo-mods.h"
+ 
+ static void set_squared_corners(struct ssd *ssd, bool enable);
+ static void set_alt_button_icon(struct ssd *ssd, enum lab_node_type type, bool enable);
+@@ -122,7 +123,7 @@
+ 	if (squared) {
+ 		ssd->state.was_squared = true;
+ 	}
+-	set_squared_corners(ssd, maximized || squared);
++	set_squared_corners(ssd, elavo_mods_squared(ssd, maximized, squared));
+ 
+ 	if (view->shaded) {
+ 		set_alt_button_icon(ssd, LAB_NODE_BUTTON_SHADE, true);
+@@ -280,7 +281,7 @@
+ 
+ 	if (ssd->state.was_maximized != maximized
+ 			|| ssd->state.was_squared != squared) {
+-		set_squared_corners(ssd, maximized || squared);
++		set_squared_corners(ssd, elavo_mods_squared(ssd, maximized, squared));
+ 		if (ssd->state.was_maximized != maximized) {
+ 			set_alt_button_icon(ssd, LAB_NODE_BUTTON_MAXIMIZE, maximized);
+ 		}
+@@ -308,7 +309,7 @@
+ 	/* Center buttons vertically within titlebar */
+ 	int y = (theme->titlebar_height - theme->window_button_height) / 2;
+ 	int x;
+-	int bg_offset = maximized || squared ? 0 : corner_width;
++	int bg_offset = elavo_mods_squared(ssd, maximized, squared) ? 0 : corner_width;
+ 
+ 	enum ssd_active_state active;
+ 	FOR_EACH_ACTIVE_STATE(active) {
+diff --git a/src/theme.c b/src/theme.c
+--- a/src/theme.c
++++ b/src/theme.c
+@@ -33,6 +33,7 @@
+ #include "labwc.h"
+ #include "buffer.h"
+ #include "ssd.h"
++#include "elavo-mods/elavo-mods.h"
+ 
+ struct button {
+ 	const char *name;
+@@ -1703,6 +1704,7 @@
+ 		+ 2 * switcher_classic_theme->item_padding_y
+ 		+ 2 * switcher_classic_theme->item_active_border_width;
+ 
++	elavo_mods_theme_loaded();
+ 	if (rc.corner_radius >= theme->titlebar_height) {
+ 		rc.corner_radius = theme->titlebar_height - 1;
+ 	}
