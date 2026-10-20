@@ -11,6 +11,7 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
+#include <wlr/util/addon.h>
 #include <wlr/util/log.h>
 #include "ext-background-effect-v1-protocol.h"
 #include "common/mem.h"
@@ -27,14 +28,25 @@ struct elavo_blur {
 	pixman_region32_t current;
 	bool has_pending;
 	bool active;
-	uint64_t seen_dirty;
+	/* The blur region changed; the signature does not cover it. */
+	bool dirty;
 	uint64_t signature;
 	struct wlr_scene_buffer *node;
 	struct wl_listener node_destroy;
+	struct elavo_blur_buffers buffers;
 };
 
+/*
+ * Counts each surface's commits. A client can draw into the buffer it
+ * already showed, which leaves the scene unchanged, so the signature mixes
+ * in this count for every surface under a backdrop. Commits elsewhere, such
+ * as Lens redrawing itself on hover, leave the backdrop alone.
+ */
 struct surface_watch {
 	struct wl_list link;
+	struct wlr_surface *surface;
+	struct wlr_addon addon;
+	uint64_t commits;
 	struct wl_listener commit;
 	struct wl_listener destroy;
 };
@@ -43,14 +55,20 @@ static struct wl_global *effect_global;
 static struct wl_list blurs = { 0 };
 static struct wl_list watches = { 0 };
 static struct wl_listener new_surface_listener;
-static uint64_t dirty_serial = 1;
 static int logged_blurs;
 static bool pixman_blocked;
+static const struct wlr_addon_interface watch_addon_impl;
 
-static void
-mark_dirty(void)
+uint64_t
+elavo_blur_surface_commits(struct wlr_surface *surface)
 {
-	dirty_serial++;
+	struct wlr_addon *addon = wlr_addon_find(&surface->addons, &watches,
+		&watch_addon_impl);
+	if (!addon) {
+		return 0;
+	}
+	struct surface_watch *watch = wl_container_of(addon, watch, addon);
+	return watch->commits;
 }
 
 static struct elavo_blur *
@@ -65,12 +83,16 @@ blur_from_surface(struct wlr_surface *surface)
 	return NULL;
 }
 
+/* Also frees the buffers; showing it again recomputes. */
 static void
 hide_node(struct elavo_blur *blur)
 {
 	if (blur->node) {
 		wlr_scene_node_set_enabled(&blur->node->node, false);
+		wlr_scene_buffer_set_buffer(blur->node, NULL);
 	}
+	elavo_blur_buffers_finish(&blur->buffers);
+	blur->signature = 0;
 }
 
 static void
@@ -88,6 +110,7 @@ destroy_blur(struct elavo_blur *blur)
 		wl_list_remove(&blur->node_destroy.link);
 		wlr_scene_node_destroy(&blur->node->node);
 	}
+	elavo_blur_buffers_finish(&blur->buffers);
 	free(blur);
 }
 
@@ -105,8 +128,8 @@ blur_handle_commit(struct wl_listener *listener, void *data)
 		pixman_region32_copy(&blur->current, &blur->pending);
 		blur->active = pixman_region32_not_empty(&blur->current);
 		blur->has_pending = false;
+		blur->dirty = true;
 	}
-	mark_dirty();
 }
 
 static void
@@ -281,13 +304,15 @@ blur_handle_node_destroy(struct wl_listener *listener, void *data)
 	struct elavo_blur *blur = wl_container_of(listener, blur, node_destroy);
 	wl_list_remove(&blur->node_destroy.link);
 	blur->node = NULL;
+	blur->signature = 0;
 }
 
 static void
 update_blur(struct elavo_blur *blur, struct output *output)
 {
 	struct wlr_scene_tree *tree = blur->surface->data;
-	if (!tree || tree->node.type != WLR_SCENE_NODE_TREE || !tree->node.parent) {
+	if (!tree || tree->node.type != WLR_SCENE_NODE_TREE || !tree->node.parent
+			|| !tree->node.enabled) {
 		hide_node(blur);
 		return;
 	}
@@ -297,7 +322,6 @@ update_blur(struct elavo_blur *blur, struct output *output)
 		return;
 	}
 	if (!blur->active || !elavo_mods_blur_enabled() || pixman_blocked) {
-		blur->seen_dirty = dirty_serial;
 		hide_node(blur);
 		return;
 	}
@@ -306,17 +330,16 @@ update_blur(struct elavo_blur *blur, struct output *output)
 	int bw = ext->x2 - ext->x1;
 	int bh = ext->y2 - ext->y1;
 	if (bw < 1 || bh < 1) {
-		blur->seen_dirty = dirty_serial;
 		hide_node(blur);
 		return;
 	}
 
 	uint64_t signature = elavo_blur_signature(&tree->node,
 		lx + ext->x1, ly + ext->y1, bw, bh);
-	if (blur->seen_dirty == dirty_serial && blur->signature == signature) {
+	if (!blur->dirty && blur->signature == signature) {
 		return;
 	}
-	blur->seen_dirty = dirty_serial;
+	blur->dirty = false;
 	blur->signature = signature;
 
 	int scale = (int)lround(output->wlr_output->scale);
@@ -328,8 +351,8 @@ update_blur(struct elavo_blur *blur, struct output *output)
 
 	struct timespec start;
 	clock_gettime(CLOCK_MONOTONIC, &start);
-	struct wlr_buffer *buffer = elavo_blur_compose(output, &tree->node,
-		lx + ext->x1, ly + ext->y1, bw, bh, &shape);
+	struct wlr_buffer *buffer = elavo_blur_compose(&blur->buffers, output,
+		&tree->node, lx + ext->x1, ly + ext->y1, bw, bh, &shape);
 	pixman_region32_fini(&shape);
 	struct timespec end;
 	clock_gettime(CLOCK_MONOTONIC, &end);
@@ -352,7 +375,6 @@ update_blur(struct elavo_blur *blur, struct output *output)
 	if (!blur->node) {
 		blur->node = wlr_scene_buffer_create(tree, NULL);
 		if (!blur->node) {
-			wlr_buffer_drop(buffer);
 			return;
 		}
 		blur->node->point_accepts_input = backdrop_accepts_input;
@@ -366,24 +388,21 @@ update_blur(struct elavo_blur *blur, struct output *output)
 	wlr_scene_node_set_position(&blur->node->node, ext->x1, ext->y1);
 	wlr_scene_buffer_set_dest_size(blur->node, bw, bh);
 	wlr_scene_buffer_set_buffer(blur->node, buffer);
-	wlr_buffer_drop(buffer);
 	wlr_scene_node_set_enabled(&blur->node->node, true);
 }
 
 static void
 any_surface_commit(struct wl_listener *listener, void *data)
 {
-	(void)listener;
 	(void)data;
-	/* A window under the dock commits without the dock committing. */
-	mark_dirty();
+	struct surface_watch *watch = wl_container_of(listener, watch, commit);
+	watch->commits++;
 }
 
 static void
-watch_handle_destroy(struct wl_listener *listener, void *data)
+free_watch(struct surface_watch *watch)
 {
-	(void)data;
-	struct surface_watch *watch = wl_container_of(listener, watch, destroy);
+	wlr_addon_finish(&watch->addon);
 	wl_list_remove(&watch->commit.link);
 	wl_list_remove(&watch->destroy.link);
 	wl_list_remove(&watch->link);
@@ -391,11 +410,33 @@ watch_handle_destroy(struct wl_listener *listener, void *data)
 }
 
 static void
+watch_handle_destroy(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct surface_watch *watch = wl_container_of(listener, watch, destroy);
+	free_watch(watch);
+}
+
+static void
+watch_addon_destroy(struct wlr_addon *addon)
+{
+	struct surface_watch *watch = wl_container_of(addon, watch, addon);
+	free_watch(watch);
+}
+
+static const struct wlr_addon_interface watch_addon_impl = {
+	.name = "elavo-blur-watch",
+	.destroy = watch_addon_destroy,
+};
+
+static void
 handle_new_surface(struct wl_listener *listener, void *data)
 {
 	(void)listener;
 	struct wlr_surface *surface = data;
 	struct surface_watch *watch = znew(*watch);
+	watch->surface = surface;
+	wlr_addon_init(&watch->addon, &surface->addons, &watches, &watch_addon_impl);
 	watch->commit.notify = any_surface_commit;
 	wl_signal_add(&surface->events.commit, &watch->commit);
 	watch->destroy.notify = watch_handle_destroy;
@@ -449,10 +490,7 @@ elavo_mods_finish(void)
 	}
 	struct surface_watch *watch, *watch_tmp;
 	wl_list_for_each_safe(watch, watch_tmp, &watches, link) {
-		wl_list_remove(&watch->commit.link);
-		wl_list_remove(&watch->destroy.link);
-		wl_list_remove(&watch->link);
-		free(watch);
+		free_watch(watch);
 	}
 	wl_list_remove(&new_surface_listener.link);
 	if (effect_global) {

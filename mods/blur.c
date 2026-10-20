@@ -229,6 +229,12 @@ sig_walk(struct wlr_scene_node *node, int ax, int ay, struct signature *sig)
 			? scene_buffer->dst_height : scene_buffer->buffer->height;
 		content = (uintptr_t)scene_buffer->buffer
 			^ ((uint64_t)lroundf(scene_buffer->opacity * 255.0f) << 56);
+		struct wlr_scene_surface *scene_surface =
+			wlr_scene_surface_try_from_buffer(scene_buffer);
+		if (scene_surface) {
+			content = content * 1000003u
+				+ elavo_blur_surface_commits(scene_surface->surface);
+		}
 	} else {
 		return false;
 	}
@@ -297,6 +303,43 @@ alloc_alpha_buffer(struct output *output, int width, int height)
 	return buffer;
 }
 
+/* The buffer in slot, replaced by a new one if it is missing or the wrong size. */
+static struct wlr_buffer *
+reuse(struct wlr_buffer **slot, struct output *output, int width, int height, bool alpha)
+{
+	if (*slot && (*slot)->width == width && (*slot)->height == height) {
+		return *slot;
+	}
+	if (*slot) {
+		wlr_buffer_drop(*slot);
+	}
+	*slot = alpha ? alloc_alpha_buffer(output, width, height)
+		: alloc_buffer(output, width, height);
+	return *slot;
+}
+
+static void
+drop_slot(struct wlr_buffer **slot)
+{
+	if (*slot) {
+		wlr_buffer_drop(*slot);
+		*slot = NULL;
+	}
+}
+
+void
+elavo_blur_buffers_finish(struct elavo_blur_buffers *buffers)
+{
+	drop_slot(&buffers->capture);
+	for (int i = 0; i < ELAVO_BLUR_MAX_LEVELS; i++) {
+		drop_slot(&buffers->down[i]);
+		drop_slot(&buffers->up[i]);
+	}
+	drop_slot(&buffers->out[0]);
+	drop_slot(&buffers->out[1]);
+	buffers->next_out = 0;
+}
+
 static void
 clear_buffer(struct wlr_render_pass *pass, int width, int height)
 {
@@ -307,18 +350,15 @@ clear_buffer(struct wlr_render_pass *pass, int width, int height)
 	});
 }
 
-static struct wlr_buffer *
-draw_scaled(struct output *output, struct wlr_texture *src, int sw, int sh, int dw, int dh)
+static bool
+draw_scaled(struct wlr_buffer *dst, struct wlr_texture *src, int sw, int sh)
 {
-	struct wlr_buffer *dst = alloc_buffer(output, dw, dh);
-	if (!dst) {
-		return NULL;
-	}
+	int dw = dst->width;
+	int dh = dst->height;
 	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
 		server.renderer, dst, NULL);
 	if (!pass) {
-		wlr_buffer_drop(dst);
-		return NULL;
+		return false;
 	}
 	clear_buffer(pass, dw, dh);
 
@@ -350,82 +390,62 @@ draw_scaled(struct output *output, struct wlr_texture *src, int sw, int sh, int 
 				: WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
 		});
 	}
-	if (!wlr_render_pass_submit(pass)) {
-		wlr_buffer_drop(dst);
-		return NULL;
-	}
-	return dst;
+	return wlr_render_pass_submit(pass);
 }
 
-static struct wlr_buffer *
-blur_levels(struct output *output, struct wlr_buffer *source, int levels)
+static bool
+scale_into(struct wlr_buffer *dst, struct wlr_buffer *src)
 {
-	struct wlr_buffer *current = source;
-	struct wlr_buffer *downs[5] = { 0 };
-	int ndown = 0;
-	int w = source->width;
-	int h = source->height;
-
-	if (levels > 5) {
-		levels = 5;
+	struct wlr_texture *tex = wlr_texture_from_buffer(server.renderer, src);
+	if (!tex) {
+		return false;
 	}
+	bool ok = draw_scaled(dst, tex, src->width, src->height);
+	wlr_texture_destroy(tex);
+	return ok;
+}
+
+/*
+ * Halve source levels times into down[], then double back up through up[],
+ * where up[i] has the size of down[i - 1] (up[0] that of source). Returns
+ * up[0], or source when levels is 0, or NULL on failure.
+ */
+static struct wlr_buffer *
+blur_levels(struct elavo_blur_buffers *buffers, struct output *output,
+		struct wlr_buffer *source, int levels)
+{
+	if (levels > ELAVO_BLUR_MAX_LEVELS) {
+		levels = ELAVO_BLUR_MAX_LEVELS;
+	}
+	struct wlr_buffer *current = source;
+	int ndown = 0;
 	for (int level = 0; level < levels; level++) {
-		int nw = w > 1 ? w / 2 : 1;
-		int nh = h > 1 ? h / 2 : 1;
-		struct wlr_texture *tex = wlr_texture_from_buffer(server.renderer, current);
-		if (!tex) {
+		int nw = current->width > 1 ? current->width / 2 : 1;
+		int nh = current->height > 1 ? current->height / 2 : 1;
+		struct wlr_buffer *down = reuse(&buffers->down[level], output, nw, nh, false);
+		if (!down || !scale_into(down, current)) {
 			break;
 		}
-		struct wlr_buffer *down = draw_scaled(output, tex, w, h, nw, nh);
-		wlr_texture_destroy(tex);
-		if (!down) {
-			break;
-		}
-		downs[ndown++] = down;
 		current = down;
-		w = nw;
-		h = nh;
+		ndown++;
 	}
 
 	for (int i = ndown - 1; i >= 0; i--) {
-		struct wlr_buffer *larger = (i == 0) ? source : downs[i - 1];
-		struct wlr_texture *tex = wlr_texture_from_buffer(server.renderer, current);
-		if (!tex) {
-			break;
-		}
-		struct wlr_buffer *up = draw_scaled(output, tex,
-			current->width, current->height, larger->width, larger->height);
-		wlr_texture_destroy(tex);
-		if (current != source) {
-			for (int j = 0; j < ndown; j++) {
-				if (downs[j] == current) {
-					downs[j] = NULL;
-				}
-			}
-			wlr_buffer_drop(current);
-		}
-		if (!up) {
-			current = NULL;
-			break;
+		struct wlr_buffer *larger = (i == 0) ? source : buffers->down[i - 1];
+		struct wlr_buffer *up = reuse(&buffers->up[i], output,
+			larger->width, larger->height, false);
+		if (!up || !scale_into(up, current)) {
+			return NULL;
 		}
 		current = up;
-	}
-
-	for (int i = 0; i < ndown; i++) {
-		if (downs[i] && downs[i] != current) {
-			wlr_buffer_drop(downs[i]);
-		}
-	}
-	if (current == source) {
-		wlr_buffer_lock(source);
 	}
 	return current;
 }
 
 struct wlr_buffer *
-elavo_blur_compose(struct output *output, struct wlr_scene_node *stop,
-		int layout_x, int layout_y, int logical_w, int logical_h,
-		const pixman_region32_t *shape)
+elavo_blur_compose(struct elavo_blur_buffers *buffers, struct output *output,
+		struct wlr_scene_node *stop, int layout_x, int layout_y,
+		int logical_w, int logical_h, const pixman_region32_t *shape)
 {
 	if (!output || !output->wlr_output || !stop || logical_w < 1 || logical_h < 1) {
 		return NULL;
@@ -444,14 +464,13 @@ elavo_blur_compose(struct output *output, struct wlr_scene_node *stop,
 		return NULL;
 	}
 
-	struct wlr_buffer *captured = alloc_buffer(output, px_w, px_h);
+	struct wlr_buffer *captured = reuse(&buffers->capture, output, px_w, px_h, false);
 	if (!captured) {
 		return NULL;
 	}
 	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
 		server.renderer, captured, NULL);
 	if (!pass) {
-		wlr_buffer_drop(captured);
 		return NULL;
 	}
 	clear_buffer(pass, px_w, px_h);
@@ -473,35 +492,28 @@ elavo_blur_compose(struct output *output, struct wlr_scene_node *stop,
 	}
 	free(cap.temps);
 	if (!ok) {
-		wlr_buffer_drop(captured);
 		return NULL;
 	}
 
-	struct wlr_buffer *blurred = blur_levels(output, captured, levels);
-	if (blurred != captured) {
-		wlr_buffer_drop(captured);
-	}
+	struct wlr_buffer *blurred = blur_levels(buffers, output, captured, levels);
 	if (!blurred) {
 		return NULL;
 	}
 
 	int out_w = logical_w * scale;
 	int out_h = logical_h * scale;
-	struct wlr_buffer *out = alloc_alpha_buffer(output, out_w, out_h);
+	struct wlr_buffer *out = reuse(&buffers->out[buffers->next_out],
+		output, out_w, out_h, true);
 	if (!out) {
-		wlr_buffer_drop(blurred);
 		return NULL;
 	}
 	struct wlr_texture *tex = wlr_texture_from_buffer(server.renderer, blurred);
-	wlr_buffer_drop(blurred);
 	if (!tex) {
-		wlr_buffer_drop(out);
 		return NULL;
 	}
 	pass = wlr_renderer_begin_buffer_pass(server.renderer, out, NULL);
 	if (!pass) {
 		wlr_texture_destroy(tex);
-		wlr_buffer_drop(out);
 		return NULL;
 	}
 	clear_buffer(pass, out_w, out_h);
@@ -520,8 +532,8 @@ elavo_blur_compose(struct output *output, struct wlr_scene_node *stop,
 	ok = wlr_render_pass_submit(pass);
 	wlr_texture_destroy(tex);
 	if (!ok) {
-		wlr_buffer_drop(out);
 		return NULL;
 	}
+	buffers->next_out ^= 1;
 	return out;
 }
