@@ -2,7 +2,7 @@
 
 Elavo's labwc features, compiled into an untouched upstream tree.
 
-[`elavo-labwc`](https://github.com/elavo-io/elavo-labwc) is a mirror of upstream labwc. Nothing in this repository is committed there. `scripts/assemble.sh` checks the mirror out at `LABWC_REF`, copies `mods/` into `src/elavo-mods/`, and applies `patches/0001-elavo-mods-hooks.patch`. That patch is the only edit to labwc source: init and teardown, the server-side decoration and shadow updates, view geometry changes, theme load, and the output frame.
+[`elavo-labwc`](https://github.com/elavo-io/elavo-labwc) is a mirror of upstream labwc. Nothing in this repository is committed there. `scripts/assemble.sh` checks the mirror out at `LABWC_REF`, copies `mods/` into `src/elavo-mods/`, and applies the files in `patches/` in order. These are the only edits to labwc source. `0001-elavo-mods-hooks.patch` adds the hooks: init and teardown, the server-side decoration and shadow updates, view geometry changes, theme load, and the output frame. `0002-session-lock-locked-after-cover.patch` makes labwc cover each output in black as soon as a lock starts, and tell the lock client "locked" only after that frame has been presented. Upstream sends it at once, so a laptop could suspend with the unlocked desktop still on the panel and show it again on wake.
 
 GPL-2.0-only, the same license as labwc.
 

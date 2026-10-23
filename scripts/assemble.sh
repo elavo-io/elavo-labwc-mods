@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check out the pinned labwc mirror, copy the mods in, apply the hook patch, and build.
+# Check out the pinned labwc mirror, copy the mods in, apply the patches in order, and build.
 # The mirror is never modified. Dev builds and the image use this script.
 set -euo pipefail
 
@@ -28,7 +28,9 @@ git -C "$work" checkout --detach "$ref"
 rm -rf "$work/src/elavo-mods"
 mkdir -p "$work/src/elavo-mods"
 cp -a "$root/mods/." "$work/src/elavo-mods/"
-git -C "$work" apply "$root/patches/0001-elavo-mods-hooks.patch"
+for patch in "$root"/patches/*.patch; do
+  git -C "$work" apply "$patch"
+done
 
 meson setup "$work/build" "$work" --buildtype=release
 meson compile -C "$work/build"
