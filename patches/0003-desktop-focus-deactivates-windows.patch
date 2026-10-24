@@ -1,0 +1,26 @@
+diff --git a/src/seat.c b/src/seat.c
+index 9cbaae5..6695422 100644
+--- a/src/seat.c
++++ b/src/seat.c
+@@ -664,6 +664,21 @@ handle_focus_change(struct wl_listener *listener, void *data)
+ 	 * or xwayland-unmanaged) from updating view state
+ 	 */
+ 	if (surface && !view) {
++		/*
++		 * Elavo: a layer surface on the bottom or background layer is the
++		 * desktop. When it takes the keyboard it becomes the active
++		 * surface, so windows draw as inactive and the window list
++		 * reports no active window. Panels, launchers, and OSDs live on
++		 * higher layers and leave the active window alone.
++		 */
++		struct wlr_layer_surface_v1 *layer =
++			wlr_layer_surface_v1_try_from_wlr_surface(surface);
++		if (layer && layer->current.layer <= ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM
++				&& server.input_mode == LAB_INPUT_STATE_PASSTHROUGH
++				&& server.active_view) {
++			view_set_activated(server.active_view, false);
++			server.active_view = NULL;
++		}
+ 		return;
+ 	}
+ 
