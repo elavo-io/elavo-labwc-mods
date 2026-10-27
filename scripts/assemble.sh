@@ -32,6 +32,8 @@ for patch in "$root"/patches/*.patch; do
   git -C "$work" apply "$patch"
 done
 
-meson setup "$work/build" "$work" --buildtype=release
+# Xwayland is required: left on auto, a missing build dependency drops X11
+# support without an error, and apps such as Steam do not start.
+meson setup "$work/build" "$work" --buildtype=release -Dxwayland=enabled
 meson compile -C "$work/build"
 echo "built $work/build/labwc"
