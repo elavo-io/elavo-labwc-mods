@@ -4,6 +4,7 @@
 #include "elavo-mods-internal.h"
 #include "blur.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -33,6 +34,18 @@ struct elavo_blur {
 	uint64_t signature;
 	struct wlr_scene_buffer *node;
 	struct wl_listener node_destroy;
+	/*
+	 * surface->data is the scene tree while the popup or layer surface
+	 * owns it, and a dangling pointer after that tree is freed. A freed
+	 * node's parent can be a non-canonical heap cookie; walking it in
+	 * wlr_scene_node_coords is a general protection fault, which takes
+	 * the session down. Remember the tree, drop it when the tree dies,
+	 * and never follow a parent that is not an address we can read.
+	 */
+	struct wlr_scene_tree *tree;
+	struct wlr_scene_tree *dead;
+	struct wl_listener tree_destroy;
+	bool tree_listening;
 	struct elavo_blur_buffers buffers;
 };
 
@@ -106,6 +119,10 @@ destroy_blur(struct elavo_blur *blur)
 	wl_list_remove(&blur->link);
 	pixman_region32_fini(&blur->pending);
 	pixman_region32_fini(&blur->current);
+	if (blur->tree_listening) {
+		wl_list_remove(&blur->tree_destroy.link);
+		blur->tree_listening = false;
+	}
 	if (blur->node) {
 		wl_list_remove(&blur->node_destroy.link);
 		wlr_scene_node_destroy(&blur->node->node);
@@ -159,10 +176,8 @@ effect_set_blur_region(struct wl_client *client, struct wl_resource *resource,
 	if (!blur) {
 		return;
 	}
+	/* The protocol makes the object inert once its surface is gone. */
 	if (!blur->surface) {
-		wl_resource_post_error(resource,
-			EXT_BACKGROUND_EFFECT_SURFACE_V1_ERROR_SURFACE_DESTROYED,
-			"surface destroyed");
 		return;
 	}
 	pixman_region32_clear(&blur->pending);
@@ -258,16 +273,69 @@ elavo_blur_is_ours(struct wlr_scene_node *node)
 	return false;
 }
 
+/* Userspace addresses are canonical. A freed scene node's parent is often not. */
 static bool
-surface_on_output(struct wlr_scene_node *node, struct output *output, int *lx, int *ly)
+ptr_ok(const void *ptr)
 {
-	if (!wlr_scene_node_coords(node, lx, ly)) {
+	uintptr_t value = (uintptr_t)ptr;
+	uintptr_t high = value >> 47;
+	if (high != 0 && high != 0x1ffffULL) {
 		return false;
 	}
+	return value >= 4096;
+}
+
+/*
+ * Same walk as wlr_scene_node_coords, but a bad parent stops the walk
+ * instead of faulting. Depth is bounded so a cycle cannot hang the frame.
+ */
+static bool
+coords_ok(struct wlr_scene_node *node, int *lx, int *ly)
+{
+	int x = 0;
+	int y = 0;
+	bool enabled = true;
+	for (int i = 0; i < 64; i++) {
+		if (!ptr_ok(node)) {
+			return false;
+		}
+		x += node->x;
+		y += node->y;
+		enabled = enabled && node->enabled;
+		if (!node->parent) {
+			*lx = x;
+			*ly = y;
+			return enabled;
+		}
+		if (!ptr_ok(node->parent)) {
+			return false;
+		}
+		node = &node->parent->node;
+	}
+	return false;
+}
+
+static bool
+blur_on_output(struct wlr_scene_node *node, const pixman_region32_t *region,
+		struct output *output, int *lx, int *ly)
+{
+	if (!coords_ok(node, lx, ly)) {
+		return false;
+	}
+	/*
+	 * Test the blurred area, not the surface origin. A GTK popup's
+	 * surface starts at its shadow's outer edge, which can be off the
+	 * output while the menu itself is on it.
+	 */
+	pixman_box32_t *ext = pixman_region32_extents((pixman_region32_t *)region);
+	int x1 = *lx + ext->x1;
+	int y1 = *ly + ext->y1;
+	int x2 = *lx + (ext->x2 > ext->x1 ? ext->x2 : ext->x1 + 1);
+	int y2 = *ly + (ext->y2 > ext->y1 ? ext->y2 : ext->y1 + 1);
 	struct wlr_box box;
 	wlr_output_layout_get_box(server.output_layout, output->wlr_output, &box);
-	return *lx < box.x + box.width && *lx + 1 > box.x
-		&& *ly < box.y + box.height && *ly + 1 > box.y;
+	return x1 < box.x + box.width && x2 > box.x
+		&& y1 < box.y + box.height && y2 > box.y;
 }
 
 static void
@@ -308,17 +376,139 @@ blur_handle_node_destroy(struct wl_listener *listener, void *data)
 }
 
 static void
+blur_handle_tree_destroy(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct elavo_blur *blur = wl_container_of(listener, blur, tree_destroy);
+	wl_list_remove(&blur->tree_destroy.link);
+	blur->tree_listening = false;
+	/*
+	 * The tree destroy frees our backdrop node with the rest of its
+	 * children. Drop the pointer; destroying it here would free it twice.
+	 */
+	if (blur->node) {
+		wl_list_remove(&blur->node_destroy.link);
+		blur->node = NULL;
+	}
+	blur->dead = blur->tree;
+	blur->tree = NULL;
+	blur->signature = 0;
+	elavo_blur_buffers_finish(&blur->buffers);
+}
+
+static void
+forget_tree(struct elavo_blur *blur)
+{
+	if (blur->tree_listening) {
+		wl_list_remove(&blur->tree_destroy.link);
+		blur->tree_listening = false;
+	}
+	blur->tree = NULL;
+}
+
+/*
+ * A popup's surface->data is only set while labwc has a scene tree for
+ * it, and labwc frees that tree after the surface unmaps. A menu that
+ * closes and opens again keeps its wl_surface and its blur, so the
+ * pointer is read only while the surface is mapped.
+ */
+static struct wlr_scene_tree *
+blur_tree(struct elavo_blur *blur)
+{
+	if (!blur->surface || !blur->surface->mapped) {
+		return NULL;
+	}
+	if (blur->tree) {
+		if (!ptr_ok(blur->tree) || blur->tree->node.type != WLR_SCENE_NODE_TREE
+				|| !ptr_ok(blur->tree->node.parent) || !blur->tree->node.enabled) {
+			return NULL;
+		}
+		return blur->tree;
+	}
+	void *data = blur->surface ? blur->surface->data : NULL;
+	if (!ptr_ok(data) || data == (void *)blur->dead) {
+		return NULL;
+	}
+	struct wlr_scene_tree *tree = data;
+	if (tree->node.type != WLR_SCENE_NODE_TREE || !ptr_ok(tree->node.parent)
+			|| !tree->node.enabled) {
+		return NULL;
+	}
+	blur->tree = tree;
+	blur->dead = NULL;
+	blur->tree_destroy.notify = blur_handle_tree_destroy;
+	wl_signal_add(&tree->node.events.destroy, &blur->tree_destroy);
+	blur->tree_listening = true;
+	return tree;
+}
+
+/*
+ * The scene buffer that shows `surface`, under `node`. An xdg popup's tree
+ * is placed at its window geometry, and the surface sits at minus that
+ * geometry inside it, so the blur region (surface-local) is placed relative
+ * to this buffer, not to the tree.
+ */
+static struct wlr_scene_buffer *
+surface_buffer(struct wlr_scene_node *node, struct wlr_surface *surface, int depth)
+{
+	if (depth > 16 || !ptr_ok(node)) {
+		return NULL;
+	}
+	if (node->type == WLR_SCENE_NODE_BUFFER) {
+		struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
+		struct wlr_scene_surface *scene_surface =
+			wlr_scene_surface_try_from_buffer(buffer);
+		if (scene_surface && scene_surface->surface == surface) {
+			return buffer;
+		}
+		return NULL;
+	}
+	if (node->type != WLR_SCENE_NODE_TREE) {
+		return NULL;
+	}
+	struct wlr_scene_tree *tree = wlr_scene_tree_from_node(node);
+	struct wlr_scene_node *child;
+	wl_list_for_each(child, &tree->children, link) {
+		struct wlr_scene_buffer *found = surface_buffer(child, surface, depth + 1);
+		if (found) {
+			return found;
+		}
+	}
+	return NULL;
+}
+
+static void
 update_blur(struct elavo_blur *blur, struct output *output)
 {
-	struct wlr_scene_tree *tree = blur->surface->data;
-	if (!tree || tree->node.type != WLR_SCENE_NODE_TREE || !tree->node.parent
-			|| !tree->node.enabled) {
-		hide_node(blur);
+	struct wlr_scene_tree *tree = blur_tree(blur);
+	if (!tree) {
+		/*
+		 * The tree destroy listener has not fired, so the tree and
+		 * the backdrop in it are still alive. Hide the backdrop and
+		 * let go of the tree; it is read again once the surface maps.
+		 */
+		if (blur->node && blur->tree_listening) {
+			hide_node(blur);
+		}
+		if (blur->surface && !blur->surface->mapped) {
+			if (blur->node) {
+				wl_list_remove(&blur->node_destroy.link);
+				wlr_scene_node_destroy(&blur->node->node);
+				blur->node = NULL;
+			}
+			forget_tree(blur);
+		}
+		blur->signature = 0;
 		return;
 	}
+	struct wlr_scene_buffer *shown = surface_buffer(&tree->node, blur->surface, 0);
+	if (!shown || !shown->node.parent) {
+		return;
+	}
+	struct wlr_scene_tree *host = shown->node.parent;
 	int lx = 0;
 	int ly = 0;
-	if (!surface_on_output(&tree->node, output, &lx, &ly)) {
+	if (!blur_on_output(&shown->node, &blur->current, output, &lx, &ly)) {
 		return;
 	}
 	if (!blur->active || !elavo_mods_blur_enabled() || pixman_blocked) {
@@ -368,12 +558,13 @@ update_blur(struct elavo_blur *blur, struct output *output)
 	}
 
 	/*
-	 * The backdrop is the bottom child of the surface's own tree, not a
-	 * sibling of it. labwc walks each layer tree's children as layer
-	 * surfaces, and a foreign sibling there aborts the next arrange.
+	 * The backdrop is the bottom child of the tree that holds the
+	 * surface's buffer, inside the popup or layer surface's own tree,
+	 * not a sibling of it. labwc walks each layer tree's children as
+	 * layer surfaces, and a foreign sibling there aborts the next arrange.
 	 */
 	if (!blur->node) {
-		blur->node = wlr_scene_buffer_create(tree, NULL);
+		blur->node = wlr_scene_buffer_create(host, NULL);
 		if (!blur->node) {
 			return;
 		}
@@ -381,11 +572,12 @@ update_blur(struct elavo_blur *blur, struct output *output)
 		blur->node_destroy.notify = blur_handle_node_destroy;
 		wl_signal_add(&blur->node->node.events.destroy, &blur->node_destroy);
 	}
-	if (blur->node->node.parent != tree) {
-		wlr_scene_node_reparent(&blur->node->node, tree);
+	if (blur->node->node.parent != host) {
+		wlr_scene_node_reparent(&blur->node->node, host);
 	}
 	wlr_scene_node_lower_to_bottom(&blur->node->node);
-	wlr_scene_node_set_position(&blur->node->node, ext->x1, ext->y1);
+	wlr_scene_node_set_position(&blur->node->node,
+		shown->node.x + ext->x1, shown->node.y + ext->y1);
 	wlr_scene_buffer_set_dest_size(blur->node, bw, bh);
 	wlr_scene_buffer_set_buffer(blur->node, buffer);
 	wlr_scene_node_set_enabled(&blur->node->node, true);
