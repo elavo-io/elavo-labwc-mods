@@ -1,0 +1,302 @@
+diff --git a/docs/labwc-config.5.scd b/docs/labwc-config.5.scd
+index f8943307..1fab6739 100644
+--- a/docs/labwc-config.5.scd
++++ b/docs/labwc-config.5.scd
+@@ -1048,7 +1048,12 @@ Note: To rotate touch events with output rotation, use the libinput
+ 
+ *<touch mapToOutput="" />*
+ 	Direct cursor movement to a specified output. If the compositor is
+-	running in nested mode, this does not take effect.
++	running in nested mode, this does not take effect. If left empty (and
++	the device has no udev/libinput output association), touch devices are
++	mapped to the first usable built-in panel output whose name starts
++	with `eDP`, `LVDS` or `DSI`. If no such output exists, the previous
++	behaviour of spanning the whole layout is kept. Mappings are re-applied
++	when outputs change.
+ 
+ *<touch mouseEmulation="" />*
+ 	If mouseEmulation is enabled, all touch up/down/motion events are
+diff --git a/include/labwc.h b/include/labwc.h
+index 87a42198..06461e8c 100644
+--- a/include/labwc.h
++++ b/include/labwc.h
+@@ -127,6 +127,7 @@ struct seat {
+ 	struct wl_listener touch_down;
+ 	struct wl_listener touch_up;
+ 	struct wl_listener touch_motion;
++	struct wl_listener touch_cancel;
+ 	struct wl_listener touch_frame;
+ 
+ 	struct wl_listener tablet_tool_proximity;
+diff --git a/src/input/touch.c b/src/input/touch.c
+index a6196530..04fc9473 100644
+--- a/src/input/touch.c
++++ b/src/input/touch.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include "input/touch.h"
+ #include <wayland-util.h>
++#include <wlr/types/wlr_compositor.h>
+ #include <wlr/types/wlr_cursor.h>
+ #include <wlr/types/wlr_scene.h>
+ #include <wlr/types/wlr_seat.h>
+@@ -14,6 +15,7 @@
+ #include "config/rcxml.h"
+ #include "config/touch.h"
+ #include "idle.h"
++#include "input/cursor.h"
+ #include "labwc.h"
+ #include "ssd.h"
+ #include "view.h"
+@@ -90,31 +92,47 @@ handle_touch_motion(struct wl_listener *listener, void *data)
+ 	/* Find existing touch point to determine initial offsets to subtract */
+ 	struct touch_point *touch_point;
+ 	wl_list_for_each(touch_point, &seat->touch_points, link) {
+-		if (touch_point->touch_id == event->touch_id) {
+-			if (touch_point->surface) {
+-				/* Convert coordinates: first [0, 1] => layout */
+-				double lx, ly;
+-				wlr_cursor_absolute_to_layout_coords(seat->cursor,
+-					&event->touch->base, event->x, event->y, &lx, &ly);
+-
+-				/* Apply offsets to get surface coords before reporting event */
+-				double sx = lx - touch_point->x_offset;
+-				double sy = ly - touch_point->y_offset;
+-
+-				if (touch_point_count == 1) {
+-					wlr_cursor_warp_absolute(seat->cursor, &event->touch->base,
+-						event->x, event->y);
+-				}
+-				wlr_seat_touch_notify_motion(seat->wlr_seat, event->time_msec,
+-					event->touch_id, sx, sy);
+-			} else {
+-				if (touch_point_count == 1) {
+-					cursor_emulate_move_absolute(seat, &event->touch->base,
+-						event->x, event->y, event->time_msec);
+-				}
+-			}
++		if (touch_point->touch_id != event->touch_id) {
++			continue;
++		}
++
++		/*
++		 * Drive interactive move/resize from the primary touch point.
++		 * CSD clients start those via xdg_toplevel.move/resize after
++		 * touch-down; without this, motion keeps going to the client
++		 * and the grab never follows the finger.
++		 */
++		if (touch_point_count == 1
++				&& (server.input_mode == LAB_INPUT_STATE_MOVE
++				|| server.input_mode == LAB_INPUT_STATE_RESIZE)) {
++			cursor_emulate_move_absolute(seat, &event->touch->base,
++				event->x, event->y, event->time_msec);
+ 			return;
+ 		}
++
++		if (touch_point->surface) {
++			/* Convert coordinates: first [0, 1] => layout */
++			double lx, ly;
++			wlr_cursor_absolute_to_layout_coords(seat->cursor,
++				&event->touch->base, event->x, event->y, &lx, &ly);
++
++			/* Apply offsets to get surface coords before reporting event */
++			double sx = lx - touch_point->x_offset;
++			double sy = ly - touch_point->y_offset;
++
++			if (touch_point_count == 1) {
++				wlr_cursor_warp_absolute(seat->cursor, &event->touch->base,
++					event->x, event->y);
++			}
++			wlr_seat_touch_notify_motion(seat->wlr_seat, event->time_msec,
++				event->touch_id, sx, sy);
++		} else {
++			if (touch_point_count == 1) {
++				cursor_emulate_move_absolute(seat, &event->touch->base,
++					event->x, event->y, event->time_msec);
++			}
++		}
++		return;
+ 	}
+ }
+ 
+@@ -173,10 +191,22 @@ handle_touch_down(struct wl_listener *listener, void *data)
+ 			}
+ 		}
+ 
++		/*
++		 * Warp first so get_cursor_context() matches this touch, then
++		 * seed the same grab state pointer presses use. That lets a
++		 * CSD client's xdg_toplevel.move/resize (with this touch
++		 * serial) pass interactive_begin()'s grabbed_view check.
++		 */
++		wlr_cursor_warp_absolute(seat->cursor, &event->touch->base,
++			event->x, event->y);
+ 		if (touch_point_count == 1) {
+-			wlr_cursor_warp_absolute(seat->cursor, &event->touch->base,
+-				event->x, event->y);
++			struct cursor_context ctx = get_cursor_context();
++			if (ctx.view || ctx.surface) {
++				cursor_context_save(&seat->pressed, &ctx);
++				interactive_set_grab_context(&ctx);
++			}
+ 		}
++
+ 		wlr_seat_touch_notify_down(seat->wlr_seat, touch_point->surface,
+ 			event->time_msec, event->touch_id, sx, sy);
+ 	} else {
+@@ -189,6 +219,42 @@ handle_touch_down(struct wl_listener *listener, void *data)
+ 	}
+ }
+ 
++static void
++finish_touch_point(struct seat *seat, struct touch_point *touch_point,
++		uint32_t time_msec, bool cancelled)
++{
++	if (touch_point->surface) {
++		if (cancelled) {
++			struct wl_client *client = wl_resource_get_client(
++				touch_point->surface->resource);
++			struct wlr_seat_client *seat_client =
++				wlr_seat_client_for_wl_client(seat->wlr_seat, client);
++			if (seat_client) {
++				wlr_seat_touch_notify_cancel(seat->wlr_seat, seat_client);
++			}
++		} else {
++			wlr_seat_touch_notify_up(seat->wlr_seat, time_msec,
++				touch_point->touch_id);
++		}
++		wl_list_remove(&touch_point->link);
++		zfree(touch_point);
++		/*
++		 * Native-touch path never went through button emulation, so
++		 * end an interactive move/resize (or clear a unused grab)
++		 * when the last finger lifts / is cancelled.
++		 */
++		if (wl_list_empty(&seat->touch_points)) {
++			cursor_finish_button_release(seat, BTN_LEFT);
++		}
++	} else {
++		cursor_emulate_button(seat, BTN_LEFT,
++			WL_POINTER_BUTTON_STATE_RELEASED, time_msec);
++		ssd_update_hovered_button(NULL);
++		wl_list_remove(&touch_point->link);
++		zfree(touch_point);
++	}
++}
++
+ static void
+ handle_touch_up(struct wl_listener *listener, void *data)
+ {
+@@ -201,16 +267,26 @@ handle_touch_up(struct wl_listener *listener, void *data)
+ 	struct touch_point *touch_point, *tmp;
+ 	wl_list_for_each_safe(touch_point, tmp, &seat->touch_points, link) {
+ 		if (touch_point->touch_id == event->touch_id) {
+-			if (touch_point->surface) {
+-				wlr_seat_touch_notify_up(seat->wlr_seat, event->time_msec,
+-					event->touch_id);
+-			} else {
+-				cursor_emulate_button(seat, BTN_LEFT,
+-					WL_POINTER_BUTTON_STATE_RELEASED, event->time_msec);
+-				ssd_update_hovered_button(NULL);
+-			}
+-			wl_list_remove(&touch_point->link);
+-			zfree(touch_point);
++			finish_touch_point(seat, touch_point, event->time_msec,
++				/*cancelled*/ false);
++			break;
++		}
++	}
++}
++
++static void
++handle_touch_cancel(struct wl_listener *listener, void *data)
++{
++	struct seat *seat = wl_container_of(listener, seat, touch_cancel);
++	struct wlr_touch_cancel_event *event = data;
++
++	idle_manager_notify_activity(seat->wlr_seat);
++
++	struct touch_point *touch_point, *tmp;
++	wl_list_for_each_safe(touch_point, tmp, &seat->touch_points, link) {
++		if (touch_point->touch_id == event->touch_id) {
++			finish_touch_point(seat, touch_point, event->time_msec,
++				/*cancelled*/ true);
+ 			break;
+ 		}
+ 	}
+@@ -222,6 +298,7 @@ touch_init(struct seat *seat)
+ 	CONNECT_SIGNAL(seat->cursor, seat, touch_down);
+ 	CONNECT_SIGNAL(seat->cursor, seat, touch_up);
+ 	CONNECT_SIGNAL(seat->cursor, seat, touch_motion);
++	CONNECT_SIGNAL(seat->cursor, seat, touch_cancel);
+ 	CONNECT_SIGNAL(seat->cursor, seat, touch_frame);
+ }
+ 
+@@ -231,5 +308,6 @@ touch_finish(struct seat *seat)
+ 	wl_list_remove(&seat->touch_down.link);
+ 	wl_list_remove(&seat->touch_up.link);
+ 	wl_list_remove(&seat->touch_motion.link);
++	wl_list_remove(&seat->touch_cancel.link);
+ 	wl_list_remove(&seat->touch_frame.link);
+ }
+diff --git a/src/seat.c b/src/seat.c
+index 66954223..41e7773e 100644
+--- a/src/seat.c
++++ b/src/seat.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <assert.h>
+ #include <stdbool.h>
++#include <string.h>
+ #include <strings.h>
+ #include <wlr/config.h>
+ #include <wlr/types/wlr_cursor.h>
+@@ -501,6 +502,35 @@ new_keyboard(struct seat *seat, struct wlr_input_device *device, bool is_virtual
+ 	return (struct input *)keyboard;
+ }
+ 
++/*
++ * Built-in laptop/tablet panels are usually named eDP-*, LVDS-* or DSI-*.
++ * When a touch device has no udev/libinput output association and no
++ * <touch mapToOutput> config, prefer that panel over spanning the whole
++ * layout (which mis-maps the digitizer once an external monitor is added).
++ */
++static char *
++builtin_panel_output_name(void)
++{
++	static const char *const prefixes[] = { "eDP", "LVDS", "DSI" };
++	struct output *output;
++
++	wl_list_for_each(output, &server.outputs, link) {
++		const char *name;
++
++		if (!output_is_usable(output) || !output->wlr_output->name) {
++			continue;
++		}
++		name = output->wlr_output->name;
++		for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
++			size_t len = strlen(prefixes[i]);
++			if (!strncasecmp(name, prefixes[i], len)) {
++				return output->wlr_output->name;
++			}
++		}
++	}
++	return NULL;
++}
++
+ static void
+ map_touch_to_output(struct seat *seat, struct wlr_input_device *dev)
+ {
+@@ -513,7 +543,11 @@ map_touch_to_output(struct seat *seat, struct wlr_input_device *dev)
+ 		touch_config_output_name = config_entry->output_name;
+ 	}
+ 
+-	char *output_name = touch->output_name ? touch->output_name : touch_config_output_name;
++	char *output_name = touch->output_name ? touch->output_name
++		: touch_config_output_name;
++	if (!output_name) {
++		output_name = builtin_panel_output_name();
++	}
+ 	wlr_log(WLR_INFO, "map touch to output %s", output_name ? output_name : "unknown");
+ 	map_input_to_output(seat, dev, output_name);
+ }
