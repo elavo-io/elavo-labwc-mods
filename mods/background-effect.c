@@ -666,11 +666,13 @@ elavo_mods_init(void)
 	if (!effect_global) {
 		wlr_log(WLR_ERROR, "failed to advertise ext_background_effect_manager_v1");
 	}
+	elavo_mods_window_buttons_init();
 }
 
 void
 elavo_mods_finish(void)
 {
+	elavo_mods_window_buttons_finish();
 	elavo_mods_shadows_finish();
 	struct elavo_blur *blur, *tmp;
 	wl_list_for_each_safe(blur, tmp, &blurs, link) {

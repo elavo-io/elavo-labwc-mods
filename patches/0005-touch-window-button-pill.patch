@@ -1,0 +1,71 @@
+diff --git a/src/input/touch.c b/src/input/touch.c
+--- a/src/input/touch.c
++++ b/src/input/touch.c
+@@ -17,6 +17,7 @@
+ #include "idle.h"
+ #include "input/cursor.h"
+ #include "labwc.h"
++#include "elavo-mods/elavo-mods.h"
+ #include "ssd.h"
+ #include "view.h"
+ 
+@@ -26,6 +27,7 @@
+ 	double x_offset;
+ 	double y_offset;
+ 	struct wlr_surface *surface;
++	bool swallowed; /* window-button pill took this finger */
+ 	struct wl_list link; /* seat.touch_points */
+ };
+ 
+@@ -96,6 +98,14 @@
+ 			continue;
+ 		}
+ 
++		if (touch_point->swallowed) {
++			double lx, ly;
++			wlr_cursor_absolute_to_layout_coords(seat->cursor,
++				&event->touch->base, event->x, event->y, &lx, &ly);
++			elavo_mods_touch_motion(lx, ly, event->touch_id);
++			return;
++		}
++
+ 		/*
+ 		 * Drive interactive move/resize from the primary touch point.
+ 		 * CSD clients start those via xdg_toplevel.move/resize after
+@@ -151,6 +161,23 @@
+ 	struct wlr_touch_down_event *event = data;
+ 
+ 	idle_manager_notify_activity(seat->wlr_seat);
++
++	/*
++	 * A finger on the window buttons opens the enlarged pill and must
++	 * not reach the client or become a pointer click. The same for a
++	 * finger on the pill itself.
++	 */
++	double pill_lx, pill_ly;
++	wlr_cursor_absolute_to_layout_coords(seat->cursor, &event->touch->base,
++		event->x, event->y, &pill_lx, &pill_ly);
++	if (elavo_mods_touch_down(pill_lx, pill_ly, event->touch_id)) {
++		struct touch_point *swallowed = znew(*swallowed);
++		swallowed->touch_id = event->touch_id;
++		swallowed->swallowed = true;
++		wl_list_insert(&seat->touch_points, &swallowed->link);
++		cursor_set_visible(seat, /* visible */ false);
++		return;
++	}
+ 
+ 	/* Compute layout => surface offset and save for this touch point */
+ 	struct touch_point *touch_point = znew(*touch_point);
+@@ -223,6 +250,12 @@
+ finish_touch_point(struct seat *seat, struct touch_point *touch_point,
+ 		uint32_t time_msec, bool cancelled)
+ {
++	if (touch_point->swallowed) {
++		elavo_mods_touch_up(touch_point->touch_id, !cancelled);
++		wl_list_remove(&touch_point->link);
++		zfree(touch_point);
++		return;
++	}
+ 	if (touch_point->surface) {
+ 		if (cancelled) {
+ 			struct wl_client *client = wl_resource_get_client(

@@ -14,4 +14,7 @@ void elavo_mods_shadows_theme_changed(void);
 void elavo_mods_shadows_frame(void);
 void elavo_mods_shadows_finish(void);
 
+void elavo_mods_window_buttons_init(void);
+void elavo_mods_window_buttons_finish(void);
+
 #endif

@@ -36,4 +36,5 @@ labwc_sources += files(
   'theme-keys.c',
   'blur.c',
   'background-effect.c',
+  'window-buttons.c',
 )

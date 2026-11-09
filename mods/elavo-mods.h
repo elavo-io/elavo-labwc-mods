@@ -3,6 +3,7 @@
 #define ELAVO_MODS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct ssd;
 struct output;
@@ -29,5 +30,13 @@ void elavo_mods_theme_loaded(void);
 
 /* Blur opted-in surfaces before the output commits this frame. */
 void elavo_mods_output_frame(struct output *output);
+
+/*
+ * A finger on the window-button cluster, or on the enlarged pill.
+ * touch_down returns true when labwc should not deliver the touch.
+ */
+bool elavo_mods_touch_down(double lx, double ly, int32_t touch_id);
+void elavo_mods_touch_motion(double lx, double ly, int32_t touch_id);
+void elavo_mods_touch_up(int32_t touch_id, bool released);
 
 #endif /* ELAVO_MODS_H */
