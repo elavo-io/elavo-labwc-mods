@@ -192,6 +192,15 @@ pick_csd(struct view *view, double lx, double ly, struct wlr_box *visual)
 			|| !view->mapped || view->current.width <= 0) {
 		return false;
 	}
+	/*
+	 * A dialog (fixed size, or with a parent window) usually draws no
+	 * window buttons of its own, so a tap in its corner is not a tap on
+	 * a cluster. Let it through to the dialog.
+	 */
+	if (view->impl->contains_window_type
+			&& view->impl->contains_window_type(view, LAB_WINDOW_TYPE_DIALOG)) {
+		return false;
+	}
 	double vx = lx - view->current.x;
 	double vy = ly - view->current.y;
 	if (vy < 0 || vy >= CSD_HIT_H || vx < 0 || vx >= view->current.width) {
