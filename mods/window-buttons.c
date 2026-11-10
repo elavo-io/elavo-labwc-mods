@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/util/box.h>
@@ -34,6 +35,10 @@
  * color, so a dark scheme gets a dark pill. The sizes are three
  * quarters of the first pill (36px icons in a 168 by 64 pill).
  *
+ * The pill grows from half size and fades in, and shrinks and fades out
+ * the same way when it is dismissed or times out. Taps pass through as
+ * soon as it starts to close.
+ *
  * Enlarged buttons are on unless ~/.config/elavo/touch.conf says
  * otherwise. Settings writes that file. A missing file leaves them on.
  */
@@ -46,6 +51,8 @@
 #define PILL_SHADOW 5
 #define PILL_MARGIN 2
 #define PILL_MS 3000
+#define PILL_ANIM_MS 180
+#define PILL_ANIM_TICK_MS 8
 
 /* Client-side cluster. Covers a 30px title bar and a 46px header bar. */
 #define CSD_HIT_W 96
@@ -70,6 +77,14 @@ static int32_t pill_armed_id;
 static int32_t pill_tracked_id;
 static double pill_tracked_x;
 static double pill_tracked_y;
+static struct wl_event_source *anim_timer;
+static double anim_t; /* 0 hidden, 1 fully shown */
+static int anim_dir; /* 1 opening, -1 closing, 0 still */
+static int64_t anim_last_ms;
+static int pill_full_w;
+static int pill_full_h;
+static double pill_cx;
+static double pill_cy;
 
 static bool never_accepts_input(struct wlr_scene_buffer *buffer, double *sx,
 		double *sy)
@@ -288,13 +303,98 @@ unwatch_view(void)
 	pill_view = NULL;
 }
 
+static int64_t
+now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Size from 50% to 100% and opacity from 0 to 1, eased out on the way in. */
+static void
+apply_anim(void)
+{
+	if (!pill_buffer) {
+		return;
+	}
+	double inv = 1.0 - anim_t;
+	double e = 1.0 - inv * inv * inv;
+	double size = 0.5 + 0.5 * e;
+	int w = (int)(pill_full_w * size + 0.5);
+	int h = (int)(pill_full_h * size + 0.5);
+	if (w < 1) {
+		w = 1;
+	}
+	if (h < 1) {
+		h = 1;
+	}
+	wlr_scene_buffer_set_dest_size(pill_buffer, w, h);
+	wlr_scene_node_set_position(&pill_buffer->node,
+		(int)(pill_cx - w / 2.0 + 0.5), (int)(pill_cy - h / 2.0 + 0.5));
+	wlr_scene_buffer_set_opacity(pill_buffer, (float)e);
+}
+
+static int
+on_anim_tick(void *data)
+{
+	(void)data;
+	if (!pill_buffer || anim_dir == 0) {
+		return 0;
+	}
+	int64_t now = now_ms();
+	anim_t += anim_dir * (double)(now - anim_last_ms) / PILL_ANIM_MS;
+	anim_last_ms = now;
+	bool done = false;
+	if (anim_t >= 1.0) {
+		anim_t = 1.0;
+		done = true;
+	} else if (anim_t <= 0.0) {
+		anim_t = 0.0;
+		done = true;
+	}
+	apply_anim();
+	if (done) {
+		if (anim_dir < 0) {
+			wlr_scene_node_set_enabled(&pill_buffer->node, false);
+		}
+		anim_dir = 0;
+		return 0;
+	}
+	wl_event_source_timer_update(anim_timer, PILL_ANIM_TICK_MS);
+	return 0;
+}
+
+/* Run from wherever the pill is now, so a reversal does not jump. */
+static void
+start_anim(int dir)
+{
+	if (!pill_buffer) {
+		return;
+	}
+	anim_dir = dir;
+	anim_last_ms = now_ms();
+	if (!anim_timer) {
+		anim_t = dir > 0 ? 1.0 : 0.0;
+		apply_anim();
+		anim_dir = 0;
+		if (dir < 0) {
+			wlr_scene_node_set_enabled(&pill_buffer->node, false);
+		}
+		return;
+	}
+	apply_anim();
+	wl_event_source_timer_update(anim_timer, PILL_ANIM_TICK_MS);
+}
+
 static void
 hide_pill(void)
 {
 	unwatch_view();
 	pill_armed = false;
-	if (pill_buffer) {
-		wlr_scene_node_set_enabled(&pill_buffer->node, false);
+	pill_box = (struct wlr_box){0};
+	if (pill_buffer && pill_buffer->node.enabled && anim_dir >= 0) {
+		start_anim(-1);
 	}
 	if (pill_timer) {
 		wl_event_source_timer_update(pill_timer, 0);
@@ -495,12 +595,17 @@ show_pill(struct view *view, const struct wlr_box *cluster)
 		pill_buffer = lab_wlr_scene_buffer_create(pill_tree, NULL);
 		pill_buffer->point_accepts_input = never_accepts_input;
 	}
+	if (!pill_buffer->node.enabled) {
+		anim_t = 0.0;
+	}
 	wlr_scene_buffer_set_buffer(pill_buffer, &buffer->base);
-	wlr_scene_buffer_set_dest_size(pill_buffer,
-		buffer->logical_width, buffer->logical_height);
+	pill_full_w = buffer->logical_width;
+	pill_full_h = buffer->logical_height;
+	pill_cx = x - PILL_MARGIN + pill_full_w / 2.0;
+	pill_cy = y - PILL_MARGIN + pill_full_h / 2.0;
 	wlr_buffer_drop(&buffer->base);
-	wlr_scene_node_set_position(&pill_buffer->node, x - PILL_MARGIN, y - PILL_MARGIN);
 	wlr_scene_node_set_enabled(&pill_buffer->node, true);
+	start_anim(1);
 	wlr_scene_node_place_above(&pill_tree->node, &server.menu_tree->node);
 
 	pill_box = (struct wlr_box){ .x = x, .y = y, .width = PILL_W, .height = PILL_H };
@@ -627,6 +732,7 @@ elavo_mods_window_buttons_init(void)
 	pill_tree = wlr_scene_tree_create(&server.scene->tree);
 	die_if_null(pill_tree);
 	pill_timer = wl_event_loop_add_timer(server.wl_event_loop, on_pill_timeout, NULL);
+	anim_timer = wl_event_loop_add_timer(server.wl_event_loop, on_anim_tick, NULL);
 	pill_view_destroy.notify = on_view_destroy;
 }
 
@@ -634,6 +740,11 @@ void
 elavo_mods_window_buttons_finish(void)
 {
 	hide_pill();
+	anim_dir = 0;
+	if (anim_timer) {
+		wl_event_source_remove(anim_timer);
+		anim_timer = NULL;
+	}
 	if (pill_timer) {
 		wl_event_source_remove(pill_timer);
 		pill_timer = NULL;

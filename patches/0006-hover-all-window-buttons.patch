@@ -1,0 +1,80 @@
+diff --git a/src/ssd/ssd-titlebar.c b/src/ssd/ssd-titlebar.c
+--- a/src/ssd/ssd-titlebar.c
++++ b/src/ssd/ssd-titlebar.c
+@@ -487,6 +487,62 @@
+ 	ssd_update_title_positions(ssd, offset_left, offset_right);
+ }
+ 
++static bool
++is_window_control(enum lab_node_type type)
++{
++	return type == LAB_NODE_BUTTON_CLOSE
++		|| type == LAB_NODE_BUTTON_ICONIFY
++		|| type == LAB_NODE_BUTTON_MAXIMIZE;
++}
++
++/* The left or right button list of the title bar that holds this button. */
++static struct wl_list *
++button_group(struct ssd_button *button)
++{
++	struct view *view = node_view_from_node(button->node);
++	if (!view || !view->ssd) {
++		return NULL;
++	}
++	enum ssd_active_state active;
++	FOR_EACH_ACTIVE_STATE(active) {
++		struct ssd_titlebar_subtree *subtree =
++			&view->ssd->titlebar.subtrees[active];
++		struct ssd_button *b;
++		wl_list_for_each(b, &subtree->buttons_left, link) {
++			if (b == button) {
++				return &subtree->buttons_left;
++			}
++		}
++		wl_list_for_each(b, &subtree->buttons_right, link) {
++			if (b == button) {
++				return &subtree->buttons_right;
++			}
++		}
++	}
++	return NULL;
++}
++
++/*
++ * Pointing at close, minimize, or maximize shows the hover image on all three
++ * on that side, as the GTK theme does for client-side title bars.
++ */
++static void
++set_button_hover(struct ssd_button *button, bool enable)
++{
++	struct wl_list *group = is_window_control(button->type)
++		? button_group(button) : NULL;
++	if (!group) {
++		update_button_state(button, LAB_BS_HOVERED, enable);
++		return;
++	}
++	struct ssd_button *b;
++	wl_list_for_each(b, group, link) {
++		if (is_window_control(b->type)) {
++			update_button_state(b, LAB_BS_HOVERED, enable);
++		}
++	}
++}
++
+ void
+ ssd_update_hovered_button(struct wlr_scene_node *node)
+ {
+@@ -502,11 +558,11 @@
+ 
+ 	/* Disable old hover */
+ 	if (server.hovered_button) {
+-		update_button_state(server.hovered_button, LAB_BS_HOVERED, false);
++		set_button_hover(server.hovered_button, false);
+ 	}
+ 	server.hovered_button = button;
+ 	if (button) {
+-		update_button_state(button, LAB_BS_HOVERED, true);
++		set_button_hover(button, true);
+ 	}
+ }
+ 
