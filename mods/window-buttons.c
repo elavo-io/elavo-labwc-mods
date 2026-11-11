@@ -221,17 +221,15 @@ pick_csd(struct view *view, double lx, double ly, struct wlr_box *visual)
 	if (vy < 0 || vy >= CSD_HIT_H || vx < 0 || vx >= view->current.width) {
 		return false;
 	}
-	bool on_left = vx < CSD_HIT_W;
-	bool on_right = vx >= view->current.width - CSD_HIT_W;
-	if (!on_left && !on_right) {
+	/*
+	 * Elavo puts the buttons on the left, and the apps it ships honor that
+	 * layout. Only the left corner counts. The right corner of a header bar
+	 * holds an app's own controls, like Brave's new tab button or the Files
+	 * menu, and a tap there must reach the app.
+	 */
+	if (vx >= CSD_HIT_W) {
 		return false;
 	}
-	/*
-	 * Elavo puts the buttons on the left. An application that does not
-	 * pick up that layout draws them on the right instead. A narrow
-	 * window can meet both tests; use the end the finger is nearer.
-	 */
-	bool use_left = on_left && (!on_right || vx < view->current.width / 2.0);
 	int inset_x;
 	int inset_y;
 	int span;
@@ -246,9 +244,7 @@ pick_csd(struct view *view, double lx, double ly, struct wlr_box *visual)
 		inset_y = 15;
 		span = 16 * 3 + 9 * 2;
 	}
-	int x = use_left
-		? view->current.x + inset_x
-		: view->current.x + view->current.width - inset_x - span;
+	int x = view->current.x + inset_x;
 	*visual = (struct wlr_box){
 		.x = x,
 		.y = view->current.y + inset_y,
