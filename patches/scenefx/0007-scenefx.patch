@@ -1,0 +1,118 @@
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -56,6 +56,17 @@ wlroots = dependency(
+   version: ['>=0.20.1', '<0.21.0'],
+ )
+ 
++# Elavo: SceneFX replaces the wlroots scene graph (rounded corners, shadow
++# and blur nodes). The system package is used when installed; otherwise the
++# release tarball named in subprojects/scenefx.wrap is built in.
++scenefx = dependency(
++  'scenefx-0.5',
++  version: ['>=0.5.0', '<0.6.0'],
++  fallback: ['scenefx', 'scenefx'],
++  default_options: ['default_library=static', 'examples=false', 'werror=false'],
++)
++add_project_arguments('-DHAVE_SCENEFX=1', language: 'c')
++
+ wlroots_has_xwayland = wlroots.get_variable('have_xwayland') == 'true'
+ have_libsfdo = not get_option('icon').disabled()
+ 
+@@ -161,6 +172,9 @@ subdir('protocols')
+ labwc_deps = [
+   server_protos,
+   wayland_server,
++  # Before wlroots: libscenefx exports the same wlr_scene_* symbols, and
++  # the first one in link order is the one used.
++  scenefx,
+   wlroots,
+   xkbcommon,
+ 	xcb_ewmh,
+diff --git a/src/cycle/osd-thumbnail.c b/src/cycle/osd-thumbnail.c
+--- a/src/cycle/osd-thumbnail.c
++++ b/src/cycle/osd-thumbnail.c
+@@ -73,6 +73,11 @@ render_node(struct wlr_render_pass *pass,
+ 		/* should be unreached */
+ 		wlr_log(WLR_ERROR, "ignoring rect");
+ 		break;
++	case WLR_SCENE_NODE_SHADOW:
++	case WLR_SCENE_NODE_OPTIMIZED_BLUR:
++	case WLR_SCENE_NODE_BLUR:
++		/* SceneFX effects are left out of thumbnails */
++		break;
+ 	}
+ }
+ 
+diff --git a/src/debug.c b/src/debug.c
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -42,6 +42,12 @@ get_node_type(struct wlr_scene_node *node)
+ 			return "surface";
+ 		}
+ 		return "buffer";
++	case WLR_SCENE_NODE_SHADOW:
++		return "shadow";
++	case WLR_SCENE_NODE_OPTIMIZED_BLUR:
++		return "optimized-blur";
++	case WLR_SCENE_NODE_BLUR:
++		return "blur";
+ 	}
+ 	return "error";
+ }
+diff --git a/src/server.c b/src/server.c
+--- a/src/server.c
++++ b/src/server.c
+@@ -8,6 +8,7 @@
+ #include <wlr/backend/headless.h>
+ #include <wlr/backend/multi.h>
+ #include <wlr/config.h>
++#include <scenefx/render/fx_renderer/fx_renderer.h>
+ #include <wlr/render/allocator.h>
+ #include <wlr/types/wlr_alpha_modifier_v1.h>
+ #include <wlr/types/wlr_color_management_v1.h>
+@@ -406,7 +407,7 @@ handle_renderer_lost(struct wl_listener *listener, void *data)
+ {
+ 	wlr_log(WLR_INFO, "Re-creating renderer after GPU reset");
+ 
+-	struct wlr_renderer *renderer = wlr_renderer_autocreate(server.backend);
++	struct wlr_renderer *renderer = fx_renderer_create(server.backend);
+ 	if (!renderer) {
+ 		wlr_log(WLR_ERROR, "Unable to create renderer");
+ 		return;
+@@ -555,14 +556,16 @@ server_init(void)
+ 	wlr_output_destroy(wlr_headless_add_output(server.headless.backend, 0, 0));
+ 
+ 	/*
+-	 * Autocreates a renderer, either Pixman, GLES2 or Vulkan for us. The
+-	 * user can also specify a renderer using the WLR_RENDERER env var.
+-	 * The renderer is responsible for defining the various pixel formats it
+-	 * supports for shared memory, this configures that for clients.
++	 * SceneFX draws the scene graph (corner radii, shadows, blur) with
++	 * its own GLES renderer, so it cannot be Pixman or Vulkan, and
++	 * WLR_RENDERER does not apply. It needs EGL, GLES2 and a DRM render
++	 * node. The renderer also defines the pixel formats it supports for
++	 * shared memory, configured for clients below.
+ 	 */
+-	server.renderer = wlr_renderer_autocreate(server.backend);
++	server.renderer = fx_renderer_create(server.backend);
+ 	if (!server.renderer) {
+-		wlr_log(WLR_ERROR, "unable to create renderer");
++		wlr_log(WLR_ERROR, "unable to create the SceneFX renderer "
++			"(EGL, GLES2 and a DRM render node are required)");
+ 		exit(EXIT_FAILURE);
+ 	}
+ 
+diff --git a/subprojects/scenefx.wrap b/subprojects/scenefx.wrap
+new file mode 100644
+--- /dev/null
++++ b/subprojects/scenefx.wrap
+@@ -0,0 +1,8 @@
++[wrap-file]
++directory = scenefx-0.5
++source_url = https://github.com/wlrfx/scenefx/archive/refs/tags/0.5.tar.gz
++source_filename = scenefx-0.5.tar.gz
++source_hash = 0fa8ecca0e310f813efd052624c5ed7d9153d6a0fdead5cc957d34c07f9a86c6
++
++[provide]
++dependency_names = scenefx-0.5

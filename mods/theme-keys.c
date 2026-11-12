@@ -17,6 +17,10 @@ static bool round_maximized;
 static bool shadows_on_maximized;
 static bool blur_enabled = true;
 static int blur_levels = 3;
+static bool clip_corners;
+static char clip_apps[512];
+static bool fx_corners = true;
+static bool fx_shadows = true;
 
 bool
 elavo_mods_round_maximized(void)
@@ -40,6 +44,61 @@ int
 elavo_mods_blur_levels(void)
 {
 	return blur_levels;
+}
+
+bool
+elavo_mods_clip_corners(void)
+{
+	return clip_corners;
+}
+
+#ifdef HAVE_SCENEFX
+bool
+elavo_mods_fx_corners(void)
+{
+	return fx_corners;
+}
+
+bool
+elavo_mods_fx_shadows(void)
+{
+	return fx_shadows;
+}
+#else
+bool
+elavo_mods_fx_corners(void)
+{
+	return false;
+}
+
+bool
+elavo_mods_fx_shadows(void)
+{
+	return false;
+}
+#endif
+
+bool
+elavo_mods_clip_app(const char *app_id)
+{
+	if (!app_id || !app_id[0]) {
+		return false;
+	}
+	size_t len = strlen(app_id);
+	for (const char *p = clip_apps; *p; ) {
+		while (*p == ' ' || *p == ',') {
+			p++;
+		}
+		const char *end = p;
+		while (*end && *end != ' ' && *end != ',') {
+			end++;
+		}
+		if ((size_t)(end - p) == len && !strncmp(p, app_id, len)) {
+			return true;
+		}
+		p = end;
+	}
+	return false;
 }
 
 static void
@@ -85,6 +144,23 @@ apply_line(char *line)
 		if (v >= 0) {
 			shadows_on_maximized = v;
 		}
+	} else if (!strcmp(line, "window.clipCorners")) {
+		int v = parse_bool(colon + 1, -1);
+		if (v >= 0) {
+			clip_corners = v;
+		}
+	} else if (!strcmp(line, "window.fx.corners")) {
+		int v = parse_bool(colon + 1, -1);
+		if (v >= 0) {
+			fx_corners = v;
+		}
+	} else if (!strcmp(line, "window.fx.shadows")) {
+		int v = parse_bool(colon + 1, -1);
+		if (v >= 0) {
+			fx_shadows = v;
+		}
+	} else if (!strcmp(line, "window.clipApps")) {
+		snprintf(clip_apps, sizeof(clip_apps), "%s", colon + 1);
 	} else if (!strcmp(line, "window.blur.strength")) {
 		int n = atoi(colon + 1);
 		if (n < 1) {
@@ -196,6 +272,10 @@ elavo_mods_theme_loaded(void)
 	round_maximized = false;
 	shadows_on_maximized = false;
 	blur_levels = 3;
+	clip_corners = false;
+	clip_apps[0] = '\0';
+	fx_corners = true;
+	fx_shadows = true;
 
 	if (rc.theme_name) {
 		struct wl_list paths;
@@ -210,5 +290,9 @@ elavo_mods_theme_loaded(void)
 	paths_destroy(&override);
 
 	read_blur_switch();
+#ifdef HAVE_SCENEFX
+	elavo_mods_fx_blur_params();
+#endif
 	elavo_mods_shadows_theme_changed();
+	elavo_mods_clip_theme_changed();
 }

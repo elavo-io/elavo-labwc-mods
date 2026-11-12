@@ -2,7 +2,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include "elavo-mods.h"
 #include "elavo-mods-internal.h"
+#ifndef HAVE_SCENEFX
 #include "blur.h"
+#endif
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -15,6 +17,7 @@
 #include <wlr/util/addon.h>
 #include <wlr/util/log.h>
 #include "ext-background-effect-v1-protocol.h"
+#include "common/macros.h"
 #include "common/mem.h"
 #include "labwc.h"
 #include "output.h"
@@ -46,7 +49,17 @@ struct elavo_blur {
 	struct wlr_scene_tree *dead;
 	struct wl_listener tree_destroy;
 	bool tree_listening;
+#ifdef HAVE_SCENEFX
+	/*
+	 * SceneFX blur nodes, in one tree at the bottom of the tree that
+	 * holds the surface's buffer. Rebuilt when the region changes.
+	 */
+	struct wlr_scene_tree *fx;
+	struct wl_listener fx_destroy;
+	pixman_region32_t fx_region;
+#else
 	struct elavo_blur_buffers buffers;
+#endif
 };
 
 /*
@@ -64,6 +77,12 @@ struct surface_watch {
 	struct wl_listener destroy;
 };
 
+#ifdef HAVE_SCENEFX
+#define blur_buffers_finish(blur) ((void)(blur))
+#else
+#define blur_buffers_finish(blur) elavo_blur_buffers_finish(&(blur)->buffers)
+#endif
+
 static struct wl_global *effect_global;
 static struct wl_list blurs = { 0 };
 static struct wl_list watches = { 0 };
@@ -72,6 +91,31 @@ static int logged_blurs;
 static bool pixman_blocked;
 static const struct wlr_addon_interface watch_addon_impl;
 
+#ifdef HAVE_SCENEFX
+static void
+fx_drop(struct elavo_blur *blur)
+{
+	if (blur->fx) {
+		wl_list_remove(&blur->fx_destroy.link);
+		wlr_scene_node_destroy(&blur->fx->node);
+		blur->fx = NULL;
+	}
+	pixman_region32_clear(&blur->fx_region);
+}
+
+static void
+fx_hide(struct elavo_blur *blur)
+{
+	if (blur->fx) {
+		wlr_scene_node_set_enabled(&blur->fx->node, false);
+	}
+}
+#else
+#define fx_drop(blur) ((void)(blur))
+#define fx_hide(blur) ((void)(blur))
+#endif
+
+#ifndef HAVE_SCENEFX
 uint64_t
 elavo_blur_surface_commits(struct wlr_surface *surface)
 {
@@ -83,6 +127,7 @@ elavo_blur_surface_commits(struct wlr_surface *surface)
 	struct surface_watch *watch = wl_container_of(addon, watch, addon);
 	return watch->commits;
 }
+#endif
 
 static struct elavo_blur *
 blur_from_surface(struct wlr_surface *surface)
@@ -104,7 +149,8 @@ hide_node(struct elavo_blur *blur)
 		wlr_scene_node_set_enabled(&blur->node->node, false);
 		wlr_scene_buffer_set_buffer(blur->node, NULL);
 	}
-	elavo_blur_buffers_finish(&blur->buffers);
+	fx_hide(blur);
+	blur_buffers_finish(blur);
 	blur->signature = 0;
 }
 
@@ -117,6 +163,10 @@ destroy_blur(struct elavo_blur *blur)
 	wl_list_remove(&blur->commit.link);
 	wl_list_remove(&blur->destroy.link);
 	wl_list_remove(&blur->link);
+	fx_drop(blur);
+#ifdef HAVE_SCENEFX
+	pixman_region32_fini(&blur->fx_region);
+#endif
 	pixman_region32_fini(&blur->pending);
 	pixman_region32_fini(&blur->current);
 	if (blur->tree_listening) {
@@ -127,7 +177,7 @@ destroy_blur(struct elavo_blur *blur)
 		wl_list_remove(&blur->node_destroy.link);
 		wlr_scene_node_destroy(&blur->node->node);
 	}
-	elavo_blur_buffers_finish(&blur->buffers);
+	blur_buffers_finish(blur);
 	free(blur);
 }
 
@@ -222,6 +272,9 @@ manager_get_background_effect(struct wl_client *client, struct wl_resource *reso
 	blur->surface = surface;
 	pixman_region32_init(&blur->pending);
 	pixman_region32_init(&blur->current);
+#ifdef HAVE_SCENEFX
+	pixman_region32_init(&blur->fx_region);
+#endif
 	wl_list_insert(&blurs, &blur->link);
 
 	blur->commit.notify = blur_handle_commit;
@@ -261,6 +314,7 @@ manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id
 		EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR);
 }
 
+#ifndef HAVE_SCENEFX
 bool
 elavo_blur_is_ours(struct wlr_scene_node *node)
 {
@@ -272,6 +326,7 @@ elavo_blur_is_ours(struct wlr_scene_node *node)
 	}
 	return false;
 }
+#endif
 
 /* Userspace addresses are canonical. A freed scene node's parent is often not. */
 static bool
@@ -338,6 +393,7 @@ blur_on_output(struct wlr_scene_node *node, const pixman_region32_t *region,
 		&& y1 < box.y + box.height && y2 > box.y;
 }
 
+#ifndef HAVE_SCENEFX
 static void
 shape_in_buffer(pixman_region32_t *dst, const pixman_region32_t *src,
 		int origin_x, int origin_y, int scale)
@@ -356,6 +412,8 @@ shape_in_buffer(pixman_region32_t *dst, const pixman_region32_t *src,
 	}
 }
 
+#endif
+#ifndef HAVE_SCENEFX
 static bool
 backdrop_accepts_input(struct wlr_scene_buffer *buffer, double *sx, double *sy)
 {
@@ -364,7 +422,9 @@ backdrop_accepts_input(struct wlr_scene_buffer *buffer, double *sx, double *sy)
 	(void)sy;
 	return false;
 }
+#endif
 
+#ifndef HAVE_SCENEFX
 static void
 blur_handle_node_destroy(struct wl_listener *listener, void *data)
 {
@@ -374,6 +434,7 @@ blur_handle_node_destroy(struct wl_listener *listener, void *data)
 	blur->node = NULL;
 	blur->signature = 0;
 }
+#endif
 
 static void
 blur_handle_tree_destroy(struct wl_listener *listener, void *data)
@@ -390,10 +451,17 @@ blur_handle_tree_destroy(struct wl_listener *listener, void *data)
 		wl_list_remove(&blur->node_destroy.link);
 		blur->node = NULL;
 	}
+#ifdef HAVE_SCENEFX
+	if (blur->fx) {
+		wl_list_remove(&blur->fx_destroy.link);
+		blur->fx = NULL;
+	}
+	pixman_region32_clear(&blur->fx_region);
+#endif
 	blur->dead = blur->tree;
 	blur->tree = NULL;
 	blur->signature = 0;
-	elavo_blur_buffers_finish(&blur->buffers);
+	blur_buffers_finish(blur);
 }
 
 static void
@@ -477,6 +545,145 @@ surface_buffer(struct wlr_scene_node *node, struct wlr_surface *surface, int dep
 	return NULL;
 }
 
+#ifdef HAVE_SCENEFX
+static void
+handle_fx_destroy(struct wl_listener *listener, void *data)
+{
+	struct elavo_blur *blur = wl_container_of(listener, blur, fx_destroy);
+	wl_list_remove(&blur->fx_destroy.link);
+	blur->fx = NULL;
+	pixman_region32_clear(&blur->fx_region);
+}
+
+/*
+ * Clients send a rounded rectangle as one rect per corner row plus the
+ * middle (elavo-common's add_round_rect does). Recognise that shape so it
+ * becomes one SceneFX node with an antialiased radius, not a staircase of
+ * thin nodes. The radius is the first row's inset, or the run of inset rows
+ * when that is taller.
+ */
+static bool
+region_round_rect(pixman_region32_t *region, int *radius)
+{
+	int n = 0;
+	pixman_box32_t *rects = pixman_region32_rectangles(region, &n);
+	pixman_box32_t *ext = pixman_region32_extents(region);
+	*radius = 0;
+	if (n <= 1) {
+		return n == 1;
+	}
+	int y = ext->y1;
+	int top_rows = 0;
+	bool in_top = true;
+	for (int i = 0; i < n; i++) {
+		if (rects[i].y1 != y) {
+			return false; /* a gap, or two rects in one band */
+		}
+		y = rects[i].y2;
+		int left = rects[i].x1 - ext->x1;
+		int right = ext->x2 - rects[i].x2;
+		if (abs(left - right) > 1) {
+			return false;
+		}
+		if (in_top && left > 0) {
+			top_rows += rects[i].y2 - rects[i].y1;
+		} else {
+			in_top = false;
+		}
+	}
+	if (y != ext->y2) {
+		return false;
+	}
+	int first = rects[0].x1 - ext->x1;
+	*radius = MAX(first, top_rows);
+	int max = MIN(ext->x2 - ext->x1, ext->y2 - ext->y1) / 2;
+	*radius = MIN(*radius, max);
+	return true;
+}
+
+static void
+fx_add_node(struct elavo_blur *blur, int x, int y, int w, int h, int radius)
+{
+	struct wlr_scene_blur *node = wlr_scene_blur_create(blur->fx, w, h);
+	if (!node) {
+		return;
+	}
+	wlr_scene_node_set_position(&node->node, x, y);
+	if (radius > 0) {
+		wlr_scene_blur_set_corner_radius(node, radius);
+	}
+}
+
+static void
+fx_update(struct elavo_blur *blur, struct wlr_scene_tree *host,
+		struct wlr_scene_buffer *shown)
+{
+	if (!blur->fx) {
+		blur->fx = wlr_scene_tree_create(host);
+		if (!blur->fx) {
+			return;
+		}
+		blur->fx_destroy.notify = handle_fx_destroy;
+		wl_signal_add(&blur->fx->node.events.destroy, &blur->fx_destroy);
+	}
+	if (blur->fx->node.parent != host) {
+		wlr_scene_node_reparent(&blur->fx->node, host);
+	}
+	/* Below the surface: SceneFX blurs what is drawn before the node. */
+	wlr_scene_node_lower_to_bottom(&blur->fx->node);
+	/* The region is surface-local; the buffer sits at the surface origin. */
+	wlr_scene_node_set_position(&blur->fx->node, shown->node.x, shown->node.y);
+
+	/* Rebuild only when the shape changes: clients resend the same region
+	 * on many commits. */
+	if (!pixman_region32_equal(&blur->fx_region, &blur->current)
+			|| wl_list_empty(&blur->fx->children)) {
+		blur->dirty = false;
+		pixman_region32_copy(&blur->fx_region, &blur->current);
+		struct wlr_scene_node *child, *tmp;
+		wl_list_for_each_safe(child, tmp, &blur->fx->children, link) {
+			wlr_scene_node_destroy(child);
+		}
+		int radius = 0;
+		pixman_box32_t *ext = pixman_region32_extents(&blur->current);
+		if (region_round_rect(&blur->current, &radius)) {
+			fx_add_node(blur, ext->x1, ext->y1, ext->x2 - ext->x1,
+				ext->y2 - ext->y1, radius);
+		} else {
+			int n = 0;
+			pixman_box32_t *rects =
+				pixman_region32_rectangles(&blur->current, &n);
+			for (int i = 0; i < n; i++) {
+				fx_add_node(blur, rects[i].x1, rects[i].y1,
+					rects[i].x2 - rects[i].x1,
+					rects[i].y2 - rects[i].y1, 0);
+			}
+		}
+		if (logged_blurs < 8) {
+			wlr_log(WLR_INFO, "elavo blur: %d SceneFX node(s), "
+				"%dx%d radius %d",
+				wl_list_length(&blur->fx->children),
+				ext->x2 - ext->x1, ext->y2 - ext->y1, radius);
+			logged_blurs++;
+		}
+	}
+	wlr_scene_node_set_enabled(&blur->fx->node, true);
+}
+
+/* window.blur.strength (1 to 5) is the number of SceneFX blur passes. */
+void
+elavo_mods_fx_blur_params(void)
+{
+	if (!server.scene) {
+		return;
+	}
+	struct blur_data data = blur_data_get_default();
+	wlr_scene_set_blur_data(server.scene, elavo_mods_blur_levels(),
+		data.radius, data.noise, data.brightness, data.contrast,
+		data.saturation);
+}
+#endif
+
 static void
 update_blur(struct elavo_blur *blur, struct output *output)
 {
@@ -487,7 +694,11 @@ update_blur(struct elavo_blur *blur, struct output *output)
 		 * the backdrop in it are still alive. Hide the backdrop and
 		 * let go of the tree; it is read again once the surface maps.
 		 */
-		if (blur->node && blur->tree_listening) {
+		if ((blur->node
+#ifdef HAVE_SCENEFX
+				|| blur->fx
+#endif
+				) && blur->tree_listening) {
 			hide_node(blur);
 		}
 		if (blur->surface && !blur->surface->mapped) {
@@ -496,6 +707,7 @@ update_blur(struct elavo_blur *blur, struct output *output)
 				wlr_scene_node_destroy(&blur->node->node);
 				blur->node = NULL;
 			}
+			fx_drop(blur);
 			forget_tree(blur);
 		}
 		blur->signature = 0;
@@ -523,7 +735,12 @@ update_blur(struct elavo_blur *blur, struct output *output)
 		hide_node(blur);
 		return;
 	}
+#ifdef HAVE_SCENEFX
+	fx_update(blur, host, shown);
+	return;
+#endif
 
+#ifndef HAVE_SCENEFX
 	uint64_t signature = elavo_blur_signature(&tree->node,
 		lx + ext->x1, ly + ext->y1, bw, bh);
 	if (!blur->dirty && blur->signature == signature) {
@@ -581,6 +798,7 @@ update_blur(struct elavo_blur *blur, struct output *output)
 	wlr_scene_buffer_set_dest_size(blur->node, bw, bh);
 	wlr_scene_buffer_set_buffer(blur->node, buffer);
 	wlr_scene_node_set_enabled(&blur->node->node, true);
+#endif
 }
 
 static void
@@ -640,6 +858,7 @@ void
 elavo_mods_output_frame(struct output *output)
 {
 	elavo_mods_shadows_frame();
+	elavo_mods_clip_frame();
 	if (!output || wl_list_empty(&blurs)) {
 		return;
 	}
@@ -656,11 +875,15 @@ elavo_mods_init(void)
 	wl_list_init(&watches);
 	new_surface_listener.notify = handle_new_surface;
 	wl_signal_add(&server.compositor->events.new_surface, &new_surface_listener);
+#ifdef HAVE_SCENEFX
+	elavo_mods_fx_blur_params();
+#else
 	pixman_blocked = wlr_renderer_is_pixman(server.renderer)
 		&& !getenv("ELAVO_BLUR_PIXMAN");
 	if (pixman_blocked) {
 		wlr_log(WLR_INFO, "elavo blur off on the pixman renderer");
 	}
+#endif
 	effect_global = wl_global_create(server.wl_display,
 		&ext_background_effect_manager_v1_interface, 1, NULL, manager_bind);
 	if (!effect_global) {
@@ -674,6 +897,7 @@ elavo_mods_finish(void)
 {
 	elavo_mods_window_buttons_finish();
 	elavo_mods_shadows_finish();
+	elavo_mods_clip_finish();
 	struct elavo_blur *blur, *tmp;
 	wl_list_for_each_safe(blur, tmp, &blurs, link) {
 		if (blur->resource) {

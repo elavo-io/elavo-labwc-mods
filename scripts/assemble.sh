@@ -25,12 +25,7 @@ else
   git clone "$mirror" "$work"
 fi
 git -C "$work" checkout --detach "$ref"
-rm -rf "$work/src/elavo-mods"
-mkdir -p "$work/src/elavo-mods"
-cp -a "$root/mods/." "$work/src/elavo-mods/"
-for patch in "$root"/patches/*.patch; do
-  git -C "$work" apply "$patch"
-done
+"$root/scripts/apply-mods.sh" "$work"
 
 # Xwayland is required: left on auto, a missing build dependency drops X11
 # support without an error, and apps such as Steam do not start.

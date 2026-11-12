@@ -32,9 +32,15 @@ labwc_deps += declare_dependency(
 
 labwc_sources += files(
   'corners.c',
+  'clip-corners.c',
   'shadows.c',
   'theme-keys.c',
-  'blur.c',
   'background-effect.c',
   'window-buttons.c',
 )
+
+# patches/scenefx defines `scenefx`. With it, blur, corners and shadows are
+# SceneFX scene nodes; blur.c is the render-pass blur used without it.
+if not is_variable('scenefx')
+  labwc_sources += files('blur.c')
+endif

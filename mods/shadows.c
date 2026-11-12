@@ -23,6 +23,12 @@
  * decides when it shows. Windows that draw their own decorations have no
  * labwc shadow, so one is added here while they are maximized. Tiled ones
  * are left alone: GTK and libadwaita still draw their own shadow there.
+ *
+ * With SceneFX (window.fx.shadows, on by default) the same rules pick the
+ * windows, and each gets one SceneFX shadow node instead of eight buffer
+ * pieces: a gaussian box shadow with the window's corner radius, cut out
+ * under the window so a translucent window does not show it. Size and color
+ * still come from window.*.shadow.
  */
 
 struct csd_shadow {
@@ -38,10 +44,9 @@ struct csd_shadow {
 static struct wl_list shadows = { &shadows, &shadows };
 static bool rebuild_pending;
 
-bool
-elavo_mods_ssd_shadows(struct ssd *ssd)
+static bool
+ssd_shadow_rule(struct view *view)
 {
-	struct view *view = ssd->view;
 	if (!rc.shadows_enabled || view->fullscreen) {
 		return false;
 	}
@@ -56,6 +61,16 @@ elavo_mods_ssd_shadows(struct ssd *ssd)
 		return rc.shadows_on_tiled;
 	}
 	return true;
+}
+
+bool
+elavo_mods_ssd_shadows(struct ssd *ssd)
+{
+	/* The SceneFX node replaces labwc's shadow pieces. */
+	if (elavo_mods_fx_shadows()) {
+		return false;
+	}
+	return ssd_shadow_rule(ssd->view);
 }
 
 /*
@@ -284,9 +299,15 @@ drop_tree(struct csd_shadow *shadow)
 static bool
 wants_shadow(struct view *view)
 {
-	return rc.shadows_enabled && elavo_mods_shadows_on_maximized()
-		&& !view->ssd && !view->fullscreen
-		&& view->maximized == VIEW_AXIS_BOTH;
+	if (!rc.shadows_enabled || view->ssd || view->fullscreen) {
+		return false;
+	}
+	bool maximized = view->maximized == VIEW_AXIS_BOTH;
+	/* clip-corners.c cut the client's own shadow off; draw labwc's. */
+	if (elavo_mods_clip_csd(view)) {
+		return !maximized || elavo_mods_shadows_on_maximized();
+	}
+	return elavo_mods_shadows_on_maximized() && maximized;
 }
 
 static void
@@ -362,6 +383,12 @@ void
 elavo_mods_view_moved(struct view *view)
 {
 	struct csd_shadow *shadow = find_shadow(view);
+	if (elavo_mods_fx_shadows()) {
+		if (shadow) {
+			destroy_shadow(shadow);
+		}
+		return;
+	}
 	if (!shadow) {
 		if (!wants_shadow(view)) {
 			return;
@@ -376,6 +403,157 @@ elavo_mods_view_moved(struct view *view)
 	}
 	sync(shadow);
 }
+
+#ifdef HAVE_SCENEFX
+struct fx_shadow {
+	struct view *view;
+	struct wlr_scene_shadow *node;
+	struct wl_listener node_destroy;
+	struct wl_listener view_destroy;
+	struct wl_list link;
+};
+
+static struct wl_list fx_shadows = { &fx_shadows, &fx_shadows };
+
+static void
+destroy_fx_shadow(struct fx_shadow *shadow)
+{
+	wl_list_remove(&shadow->view_destroy.link);
+	wl_list_remove(&shadow->link);
+	if (shadow->node) {
+		wl_list_remove(&shadow->node_destroy.link);
+		wlr_scene_node_destroy(&shadow->node->node);
+	}
+	free(shadow);
+}
+
+static void
+handle_fx_view_destroy(struct wl_listener *listener, void *data)
+{
+	struct fx_shadow *shadow = wl_container_of(listener, shadow, view_destroy);
+	destroy_fx_shadow(shadow);
+}
+
+static void
+handle_fx_node_destroy(struct wl_listener *listener, void *data)
+{
+	struct fx_shadow *shadow = wl_container_of(listener, shadow, node_destroy);
+	wl_list_remove(&shadow->node_destroy.link);
+	shadow->node = NULL;
+}
+
+/* The box the shadow is cast by, relative to view->scene_tree. */
+static bool
+fx_shadow_frame(struct view *view, struct wlr_box *frame)
+{
+	if (!view->mapped || !view->scene_tree || view->fullscreen) {
+		return false;
+	}
+	int w = view->current.width;
+	int h = view_effective_height(view, /* use_pending */ false);
+	struct ssd *ssd = view->ssd;
+	if (ssd && ssd->tree && ssd->tree->node.enabled) {
+		if (!ssd_shadow_rule(view)) {
+			return false;
+		}
+		struct border t = ssd_thickness(view);
+		*frame = (struct wlr_box){ -t.left, -t.top,
+			w + t.left + t.right, h + t.top + t.bottom };
+	} else {
+		if (!wants_shadow(view)) {
+			return false;
+		}
+		*frame = (struct wlr_box){ 0, 0, w, h };
+	}
+	return frame->width > 0 && frame->height > 0;
+}
+
+static struct fx_shadow *
+find_fx_shadow(struct view *view)
+{
+	struct fx_shadow *shadow;
+	wl_list_for_each(shadow, &fx_shadows, link) {
+		if (shadow->view == view) {
+			return shadow;
+		}
+	}
+	return NULL;
+}
+
+static void
+sync_fx_shadow(struct view *view)
+{
+	struct fx_shadow *shadow = find_fx_shadow(view);
+	struct wlr_box frame;
+	bool show = elavo_mods_fx_shadows() && fx_shadow_frame(view, &frame);
+	enum ssd_active_state state = view == server.active_view
+		? SSD_ACTIVE : SSD_INACTIVE;
+	int size = show ? rc.theme->window[state].shadow_size : 0;
+	if (size <= 0) {
+		if (shadow && shadow->node) {
+			wlr_scene_node_set_enabled(&shadow->node->node, false);
+		}
+		return;
+	}
+	if (!shadow) {
+		shadow = znew(*shadow);
+		shadow->view = view;
+		shadow->view_destroy.notify = handle_fx_view_destroy;
+		wl_signal_add(&view->events.destroy, &shadow->view_destroy);
+		wl_list_insert(&fx_shadows, &shadow->link);
+	}
+	const float *color = rc.theme->window[state].shadow_color;
+	int r = rc.corner_radius;
+	if (!shadow->node) {
+		shadow->node = wlr_scene_shadow_create(view->scene_tree,
+			1, 1, r, size, color);
+		if (!shadow->node) {
+			return;
+		}
+		shadow->node_destroy.notify = handle_fx_node_destroy;
+		wl_signal_add(&shadow->node->node.events.destroy,
+			&shadow->node_destroy);
+		wlr_scene_node_lower_to_bottom(&shadow->node->node);
+	}
+	/*
+	 * A window labwc decorates has round bottom corners only while
+	 * clip-corners.c rounds them. One that decorates itself rounds its
+	 * own, or is clipped round.
+	 */
+	int bottom = !view->ssd || elavo_mods_clip_active(view) ? r : 0;
+	struct fx_corner_radii corners = corner_radii_new(r, r, bottom, bottom);
+	wlr_scene_shadow_set_size(shadow->node,
+		frame.width + 2 * size, frame.height + 2 * size);
+	wlr_scene_node_set_position(&shadow->node->node,
+		frame.x - size, frame.y - size);
+	wlr_scene_shadow_set_blur_sigma(shadow->node, size);
+	wlr_scene_shadow_set_corner_radius(shadow->node, r);
+	wlr_scene_shadow_set_color(shadow->node, color);
+	wlr_scene_shadow_set_clipped_region(shadow->node, (struct clipped_region){
+		.area = { size, size, frame.width, frame.height },
+		.corners = corners,
+	});
+	wlr_scene_node_set_enabled(&shadow->node->node, true);
+}
+
+static void
+fx_shadows_frame(void)
+{
+	struct view *view;
+	wl_list_for_each(view, &server.views, link) {
+		sync_fx_shadow(view);
+	}
+}
+
+static void
+fx_shadows_finish(void)
+{
+	struct fx_shadow *shadow, *tmp;
+	wl_list_for_each_safe(shadow, tmp, &fx_shadows, link) {
+		destroy_fx_shadow(shadow);
+	}
+}
+#endif
 
 void
 elavo_mods_shadows_theme_changed(void)
@@ -394,6 +572,9 @@ elavo_mods_shadows_theme_changed(void)
 void
 elavo_mods_shadows_frame(void)
 {
+#ifdef HAVE_SCENEFX
+	fx_shadows_frame();
+#endif
 	if (!rebuild_pending) {
 		return;
 	}
@@ -411,4 +592,7 @@ elavo_mods_shadows_finish(void)
 	wl_list_for_each_safe(shadow, tmp, &shadows, link) {
 		destroy_shadow(shadow);
 	}
+#ifdef HAVE_SCENEFX
+	fx_shadows_finish();
+#endif
 }
