@@ -67,7 +67,9 @@ struct piece {
 
 struct clipped {
 	struct view *view;
+	/* The client's tree, cleared by surface_tree_destroy when it goes. */
 	struct wlr_scene_node *surface_tree;
+	struct wl_listener surface_tree_destroy;
 	struct strip strips[MAX_STRIPS];
 	int n_strips;
 	int radius;
@@ -151,6 +153,19 @@ handle_piece_destroy(struct wl_listener *listener, void *data)
 	piece->buffer = NULL;
 }
 
+/*
+ * The saved surface tree is labwc's or wlroots' to free: an XWayland view
+ * destroys its content tree at unmap, and a destroyed wlr_surface takes its
+ * subsurface tree with it. Touching it after that aborts in wlroots.
+ */
+static void
+handle_surface_tree_destroy(struct wl_listener *listener, void *data)
+{
+	struct clipped *c = wl_container_of(listener, c, surface_tree_destroy);
+	wl_list_remove(&c->surface_tree_destroy.link);
+	c->surface_tree = NULL;
+}
+
 static void
 drop_strips(struct clipped *c)
 {
@@ -182,24 +197,60 @@ drop_pieces(struct clipped *c)
 	c->pieces_ssd = NULL;
 }
 
+struct holds_walk {
+	struct wlr_surface *surface; /* NULL: any surface */
+	bool found;
+};
+
+static void
+check_buffer(struct wlr_scene_buffer *buffer, int sx, int sy, void *data)
+{
+	struct holds_walk *walk = data;
+	struct wlr_scene_surface *scene_surface =
+		wlr_scene_surface_try_from_buffer(buffer);
+	if (scene_surface && (!walk->surface
+			|| scene_surface->surface == walk->surface)) {
+		walk->found = true;
+	}
+}
+
+/*
+ * Whether node holds a scene surface (for surface, or any). Only a
+ * subsurface tree makes one here, and wlr_scene_subsurface_tree_set_clip()
+ * asserts when the node it is given holds no subsurface tree.
+ */
+static bool
+holds_surface(struct wlr_scene_node *node, struct wlr_surface *surface)
+{
+	struct holds_walk walk = { .surface = surface };
+	wlr_scene_node_for_each_buffer(node, check_buffer, &walk);
+	return walk.found;
+}
+
 /* The tree wlr_scene clips: the subsurface tree of the root surface. */
 static struct wlr_scene_node *
 find_surface_tree(struct view *view)
 {
-	if (!view->content_tree) {
+	if (!view->content_tree || !view->surface) {
 		return NULL;
 	}
 	if (view->type == LAB_XDG_SHELL_VIEW) {
-		/* wlr_scene_xdg_surface_create() makes it the first child. */
-		struct wl_list *children = &view->content_tree->children;
-		if (wl_list_empty(children)) {
-			return NULL;
+		/*
+		 * wlr_scene_xdg_surface_create() makes it the first child;
+		 * popups and the strips below come after it. Take the first
+		 * child that holds the root surface, so another node lowered
+		 * to the bottom is never handed to the clip.
+		 */
+		struct wlr_scene_node *child;
+		wl_list_for_each(child, &view->content_tree->children, link) {
+			if (holds_surface(child, view->surface)) {
+				return child;
+			}
 		}
-		struct wlr_scene_node *first =
-			wl_container_of(children->next, first, link);
-		return first;
+		return NULL;
 	}
-	return &view->content_tree->node;
+	struct wlr_scene_node *node = &view->content_tree->node;
+	return holds_surface(node, view->surface) ? node : NULL;
 }
 
 static void
@@ -383,6 +434,45 @@ fx_sync(struct clipped *c, struct wlr_scene_node *surface_tree, bool csd,
 }
 #endif
 
+/*
+ * Stop tracking the saved surface tree. With reset, a tree that is still
+ * alive gets its clip (and SceneFX radii) taken off; a destroyed one was
+ * already forgotten by handle_surface_tree_destroy().
+ */
+static void
+release_surface_tree(struct clipped *c, bool reset)
+{
+	struct wlr_scene_node *node = c->surface_tree;
+	if (!node) {
+		return;
+	}
+	wl_list_remove(&c->surface_tree_destroy.link);
+	c->surface_tree = NULL;
+	if (!reset || !holds_surface(node, NULL)) {
+		return;
+	}
+#ifdef HAVE_SCENEFX
+	if (c->fx_on) {
+		struct radii_walk walk = { .radius = 0 };
+		wlr_scene_node_for_each_buffer(node, set_buffer_radii, &walk);
+	}
+#endif
+	wlr_scene_subsurface_tree_set_clip(node, NULL);
+}
+
+/* Follow the view's current surface tree, moving off the old one. */
+static void
+track_surface_tree(struct clipped *c, struct wlr_scene_node *node)
+{
+	if (c->surface_tree == node) {
+		return;
+	}
+	release_surface_tree(c, true);
+	c->surface_tree = node;
+	c->surface_tree_destroy.notify = handle_surface_tree_destroy;
+	wl_signal_add(&node->events.destroy, &c->surface_tree_destroy);
+}
+
 static void
 turn_off(struct clipped *c)
 {
@@ -395,10 +485,7 @@ turn_off(struct clipped *c)
 #endif
 	drop_strips(c);
 	drop_pieces(c);
-	if (c->surface_tree) {
-		wlr_scene_subsurface_tree_set_clip(c->surface_tree, NULL);
-		c->surface_tree = NULL;
-	}
+	release_surface_tree(c, true);
 	if (c->view->ssd && c->view->ssd->border.tree) {
 		ssd_border_update(c->view->ssd);
 	}
@@ -483,8 +570,8 @@ sync_clip(struct clipped *c)
 	int gx, gy;
 	geometry_offset(view, &gx, &gy);
 
+	track_surface_tree(c, surface_tree);
 	c->on = true;
-	c->surface_tree = surface_tree;
 
 #ifdef HAVE_SCENEFX
 	if (elavo_mods_fx_corners()) {
@@ -599,6 +686,7 @@ destroy_clipped(struct clipped *c)
 {
 	drop_strips(c);
 	drop_pieces(c);
+	release_surface_tree(c, false);
 	wl_list_remove(&c->view_destroy.link);
 	wl_list_remove(&c->link);
 	free(c);
