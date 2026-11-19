@@ -85,11 +85,16 @@ struct surface_watch {
 
 static struct wl_global *effect_global;
 static struct wl_list blurs = { 0 };
+#ifndef HAVE_SCENEFX
+/* Only the render-pass blur reads commit counts; SceneFX blurs every frame. */
 static struct wl_list watches = { 0 };
 static struct wl_listener new_surface_listener;
+#endif
 static int logged_blurs;
 static bool pixman_blocked;
+#ifndef HAVE_SCENEFX
 static const struct wlr_addon_interface watch_addon_impl;
+#endif
 
 #ifdef HAVE_SCENEFX
 static void
@@ -614,6 +619,105 @@ fx_add_node(struct elavo_blur *blur, int x, int y, int w, int h, int radius)
 	}
 }
 
+/*
+ * A region can hold several parts: Lens sends its bar and its results card,
+ * and GTK 4.24 sends the union of every widget with a backdrop blur. Read
+ * as a whole that is not one rounded rectangle, and it used to become one
+ * square blur node per band, a staircase of thin nodes that SceneFX blurs
+ * one by one. Split the rectangles into connected parts (a rectangle joins
+ * the one in the band above it when their x ranges overlap), so each part
+ * can be matched as a rounded rectangle on its own.
+ */
+#define FX_MAX_RECTS 1024
+
+static int
+fx_find(int *parent, int i)
+{
+	while (parent[i] != i) {
+		parent[i] = parent[parent[i]];
+		i = parent[i];
+	}
+	return i;
+}
+
+/* One connected part. Returns its radius when it is a rounded rectangle. */
+static int
+fx_add_part(struct elavo_blur *blur, pixman_box32_t *rects, int n)
+{
+	pixman_region32_t part;
+	pixman_region32_init_rects(&part, rects, n);
+	int radius = 0;
+	pixman_box32_t *ext = pixman_region32_extents(&part);
+	if (region_round_rect(&part, &radius)) {
+		fx_add_node(blur, ext->x1, ext->y1, ext->x2 - ext->x1,
+			ext->y2 - ext->y1, radius);
+	} else {
+		radius = 0;
+		int count = 0;
+		pixman_box32_t *boxes = pixman_region32_rectangles(&part, &count);
+		for (int i = 0; i < count; i++) {
+			fx_add_node(blur, boxes[i].x1, boxes[i].y1,
+				boxes[i].x2 - boxes[i].x1,
+				boxes[i].y2 - boxes[i].y1, 0);
+		}
+	}
+	pixman_region32_fini(&part);
+	return radius;
+}
+
+/* Returns the largest radius among the parts, for the log. */
+static int
+fx_add_parts(struct elavo_blur *blur, pixman_region32_t *region)
+{
+	int n = 0;
+	pixman_box32_t *rects = pixman_region32_rectangles(region, &n);
+	if (n <= 0) {
+		return 0;
+	}
+	if (n > FX_MAX_RECTS) {
+		return fx_add_part(blur, rects, n);
+	}
+	int *parent = calloc(n, sizeof(*parent));
+	pixman_box32_t *part = calloc(n, sizeof(*part));
+	if (!parent || !part) {
+		free(parent);
+		free(part);
+		return fx_add_part(blur, rects, n);
+	}
+	for (int i = 0; i < n; i++) {
+		parent[i] = i;
+	}
+	/* pixman keeps rectangles in bands, top to bottom, then by x. */
+	for (int i = 0; i < n; i++) {
+		for (int j = i + 1; j < n && rects[j].y1 <= rects[i].y2; j++) {
+			if (rects[j].y1 == rects[i].y2
+					&& rects[j].x1 < rects[i].x2
+					&& rects[i].x1 < rects[j].x2) {
+				parent[fx_find(parent, j)] = fx_find(parent, i);
+			}
+		}
+	}
+	int radius = 0;
+	for (int i = 0; i < n; i++) {
+		if (fx_find(parent, i) != i) {
+			continue;
+		}
+		int count = 0;
+		/* From 0: a root need not be the lowest index in its part. */
+		for (int j = 0; j < n; j++) {
+			if (fx_find(parent, j) == i) {
+				part[count++] = rects[j];
+			}
+		}
+		/* Not inside MAX(), which would add the part twice. */
+		int r = fx_add_part(blur, part, count);
+		radius = MAX(radius, r);
+	}
+	free(parent);
+	free(part);
+	return radius;
+}
+
 static void
 fx_update(struct elavo_blur *blur, struct wlr_scene_tree *host,
 		struct wlr_scene_buffer *shown)
@@ -644,21 +748,8 @@ fx_update(struct elavo_blur *blur, struct wlr_scene_tree *host,
 		wl_list_for_each_safe(child, tmp, &blur->fx->children, link) {
 			wlr_scene_node_destroy(child);
 		}
-		int radius = 0;
 		pixman_box32_t *ext = pixman_region32_extents(&blur->current);
-		if (region_round_rect(&blur->current, &radius)) {
-			fx_add_node(blur, ext->x1, ext->y1, ext->x2 - ext->x1,
-				ext->y2 - ext->y1, radius);
-		} else {
-			int n = 0;
-			pixman_box32_t *rects =
-				pixman_region32_rectangles(&blur->current, &n);
-			for (int i = 0; i < n; i++) {
-				fx_add_node(blur, rects[i].x1, rects[i].y1,
-					rects[i].x2 - rects[i].x1,
-					rects[i].y2 - rects[i].y1, 0);
-			}
-		}
+		int radius = fx_add_parts(blur, &blur->current);
 		if (logged_blurs < 8) {
 			wlr_log(WLR_INFO, "elavo blur: %d SceneFX node(s), "
 				"%dx%d radius %d",
@@ -801,6 +892,7 @@ update_blur(struct elavo_blur *blur, struct output *output)
 #endif
 }
 
+#ifndef HAVE_SCENEFX
 static void
 any_surface_commit(struct wl_listener *listener, void *data)
 {
@@ -854,6 +946,8 @@ handle_new_surface(struct wl_listener *listener, void *data)
 	wl_list_insert(&watches, &watch->link);
 }
 
+#endif
+
 void
 elavo_mods_output_frame(struct output *output)
 {
@@ -872,9 +966,11 @@ void
 elavo_mods_init(void)
 {
 	wl_list_init(&blurs);
+#ifndef HAVE_SCENEFX
 	wl_list_init(&watches);
 	new_surface_listener.notify = handle_new_surface;
 	wl_signal_add(&server.compositor->events.new_surface, &new_surface_listener);
+#endif
 #ifdef HAVE_SCENEFX
 	elavo_mods_fx_blur_params();
 #else
@@ -906,11 +1002,13 @@ elavo_mods_finish(void)
 		}
 		destroy_blur(blur);
 	}
+#ifndef HAVE_SCENEFX
 	struct surface_watch *watch, *watch_tmp;
 	wl_list_for_each_safe(watch, watch_tmp, &watches, link) {
 		free_watch(watch);
 	}
 	wl_list_remove(&new_surface_listener.link);
+#endif
 	if (effect_global) {
 		wl_global_destroy(effect_global);
 		effect_global = NULL;
