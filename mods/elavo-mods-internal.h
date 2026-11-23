@@ -33,4 +33,8 @@ void elavo_mods_fx_blur_params(void);
 void elavo_mods_window_buttons_init(void);
 void elavo_mods_window_buttons_finish(void);
 
+struct output;
+void elavo_mods_genie_frame(struct output *output);
+void elavo_mods_genie_finish(void);
+
 #endif

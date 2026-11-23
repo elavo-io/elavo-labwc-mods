@@ -32,6 +32,14 @@ void elavo_mods_theme_loaded(void);
 void elavo_mods_output_frame(struct output *output);
 
 /*
+ * A window is about to be minimized (still shown), or was just restored
+ * (labwc has shown it). Snapshot it for the dock, and pour it into the
+ * dock or back out.
+ */
+void elavo_mods_view_minimizing(struct view *view);
+void elavo_mods_view_restored(struct view *view);
+
+/*
  * A finger on the window-button cluster, or on the enlarged pill.
  * touch_down returns true when labwc should not deliver the touch.
  */

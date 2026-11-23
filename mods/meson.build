@@ -37,6 +37,7 @@ labwc_sources += files(
   'theme-keys.c',
   'background-effect.c',
   'window-buttons.c',
+  'genie.c',
 )
 
 # patches/scenefx defines `scenefx`. With it, blur, corners and shadows are

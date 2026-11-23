@@ -951,6 +951,7 @@ handle_new_surface(struct wl_listener *listener, void *data)
 void
 elavo_mods_output_frame(struct output *output)
 {
+	elavo_mods_genie_frame(output);
 	elavo_mods_shadows_frame();
 	elavo_mods_clip_frame();
 	if (!output || wl_list_empty(&blurs)) {
@@ -991,6 +992,7 @@ elavo_mods_init(void)
 void
 elavo_mods_finish(void)
 {
+	elavo_mods_genie_finish();
 	elavo_mods_window_buttons_finish();
 	elavo_mods_shadows_finish();
 	elavo_mods_clip_finish();

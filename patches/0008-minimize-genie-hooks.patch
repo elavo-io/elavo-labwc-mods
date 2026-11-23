@@ -1,0 +1,20 @@
+diff --git a/src/view.c b/src/view.c
+--- a/src/view.c
++++ b/src/view.c
+@@ -740,9 +740,16 @@ _minimize(struct view *view, bool minimized, bool *need_refocus)
+ 		view->impl->minimize(view, minimized);
+ 	}
+ 
++	/* Snapshot the window while it still shows, before the dock hears. */
++	if (minimized) {
++		elavo_mods_view_minimizing(view);
++	}
+ 	view->minimized = minimized;
+ 	wl_signal_emit_mutable(&view->events.minimized, NULL);
+ 	view_update_visibility(view);
++	if (!minimized) {
++		elavo_mods_view_restored(view);
++	}
+ 
+ 	/*
+ 	 * Need to focus a different view when:
