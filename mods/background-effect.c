@@ -562,11 +562,74 @@ handle_fx_destroy(struct wl_listener *listener, void *data)
 
 /*
  * Clients send a rounded rectangle as one rect per corner row plus the
- * middle (elavo-common's add_round_rect does). Recognise that shape so it
- * becomes one SceneFX node with an antialiased radius, not a staircase of
- * thin nodes. The radius is the first row's inset, or the run of inset rows
- * when that is taller.
+ * middle (elavo-common's add_round_rect does, and GTK 4.24 does for a widget
+ * with a backdrop filter). Recognise that shape so it becomes one SceneFX
+ * node with an antialiased radius, not a staircase of thin nodes.
+ *
+ * The radius cannot be read off the rows directly. GTK drops the rows whose
+ * inset rounds to less than a pixel, so a 33px corner arrives as 28 rows,
+ * and the first row's inset is 27 because that row is sampled at its
+ * middle. Both undershoot, and a corner drawn with the smaller radius is
+ * squarer than the widget: the blur then shows outside the rounded edge
+ * as a frosted halo. Fit the circle that produced the rows instead.
  */
+#define FX_FIT_ROWS 512
+
+/*
+ * The radius of the circular corner whose rows best match the insets, or
+ * `fallback` when no circle explains them. Rows are sampled either at their
+ * middle (GTK) or at their far edge (add_round_rect); the better fit wins.
+ */
+static int
+fit_corner_radius(const pixman_box32_t *rects, int n, const pixman_box32_t *ext,
+		int fallback)
+{
+	int width = ext->x2 - ext->x1;
+	int height = ext->y2 - ext->y1;
+	int rows = MIN(MIN(width, height) / 2, FX_FIT_ROWS);
+	if (rows < 2) {
+		return fallback;
+	}
+	double inset[FX_FIT_ROWS] = { 0 };
+	for (int i = 0; i < n; i++) {
+		double in = ((rects[i].x1 - ext->x1) + (ext->x2 - rects[i].x2)) / 2.0;
+		for (int y = rects[i].y1; y < rects[i].y2; y++) {
+			int k = y - ext->y1;
+			if (k >= 0 && k < rows) {
+				inset[k] = in;
+			}
+		}
+	}
+	double flat = 0;
+	for (int k = 0; k < rows; k++) {
+		flat += inset[k];
+	}
+	double best_err = flat;
+	int best = 0;
+	for (int r = 1; r <= rows; r++) {
+		for (int edge = 0; edge < 2; edge++) {
+			double err = 0;
+			for (int k = 0; k < rows && err < best_err; k++) {
+				double pred = 0;
+				if (k < r) {
+					double dy = r - k - (edge ? 0.0 : 0.5);
+					pred = r - sqrt(MAX((double)r * r - dy * dy, 0.0));
+				}
+				err += fabs(inset[k] - pred);
+			}
+			if (err < best_err) {
+				best_err = err;
+				best = r;
+			}
+		}
+	}
+	/* Integer rows round each inset by up to half a pixel. */
+	if (best == 0 || best_err > 0.5 * best + 1.0) {
+		return fallback;
+	}
+	return best;
+}
+
 static bool
 region_round_rect(pixman_region32_t *region, int *radius)
 {
@@ -601,6 +664,7 @@ region_round_rect(pixman_region32_t *region, int *radius)
 	}
 	int first = rects[0].x1 - ext->x1;
 	*radius = MAX(first, top_rows);
+	*radius = fit_corner_radius(rects, n, ext, *radius);
 	int max = MIN(ext->x2 - ext->x1, ext->y2 - ext->y1) / 2;
 	*radius = MIN(*radius, max);
 	return true;
